@@ -10,4 +10,9 @@
 mod line_parsers;
 mod parser;
 
+#[cfg(test)]
+mod buildkit_fixtures;
+#[cfg(test)]
+mod dump;
+
 pub use parser::{Dockerfile, Node, ParseError, ParseErrorKind, parse};

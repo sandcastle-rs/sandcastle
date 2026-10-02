@@ -1,0 +1,6 @@
+https://github.com/moby/buildkit 82a1f40db9624f03b94bc2a42f0e5bac0e89aad7
+frontend/dockerfile/parser/testfiles
+frontend/dockerfile/parser/testfiles-negative
+frontend/dockerfile/parser/testfile-line
+frontend/dockerfile/shell/envVarTest
+frontend/dockerfile/shell/wordsTest
