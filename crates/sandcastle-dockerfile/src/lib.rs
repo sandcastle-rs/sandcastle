@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod instruction;
 mod line_parsers;
 mod parser;
 
@@ -15,4 +16,7 @@ mod buildkit_fixtures;
 #[cfg(test)]
 mod dump;
 
+pub use instruction::{
+    Command, Flag, Instruction, InstructionError, InstructionErrorKind, KeyValue,
+};
 pub use parser::{Dockerfile, Node, ParseError, ParseErrorKind, parse};
