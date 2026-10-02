@@ -88,7 +88,7 @@ async fn pull_async(blobs: &BlobStore<'_>, reference: &Reference) -> Result<Pull
         config_size,
         MAX_CONFIG_BYTES,
     )?;
-    let mut config_bytes = CappedBuffer::new(config_size);
+    let mut config_bytes = CappedWriter::new(Vec::new(), config_size);
     client
         .pull_blob(
             reference,
@@ -141,12 +141,23 @@ async fn fetch_layer(
 ) -> Result<()> {
     let temp = blobs.temp()?;
     let file = tokio::fs::File::from_std(temp.as_file().try_clone()?);
-    // pull_blob verifies the digest while streaming and fails on a mismatch.
+    // pull_blob verifies the digest while streaming and fails on a mismatch;
+    // CappedWriter stops a registry streaming past the declared size.
     // Descriptor `urls` are dropped so blobs only come from the registry.
     client
-        .pull_blob(reference, &without_urls(remote), file)
+        .pull_blob(
+            reference,
+            &without_urls(remote),
+            CappedWriter::new(file, local.size()),
+        )
         .await
-        .with_context(|| format!("downloading layer {}", local.digest()))?;
+        .with_context(|| {
+            format!(
+                "downloading layer {} (declared {} bytes)",
+                local.digest(),
+                local.size()
+            )
+        })?;
     let actual = temp.as_file().metadata()?.len();
     check_downloaded_size(local.digest().as_ref(), local.size(), actual)?;
     blobs.commit(temp, local.digest())?;
@@ -180,48 +191,58 @@ fn without_urls(remote: &OciDescriptor) -> OciDescriptor {
     }
 }
 
-/// In-memory sink that fails once more than `limit` bytes are written.
-struct CappedBuffer {
-    bytes: Vec<u8>,
+/// Writer that forwards at most `limit` bytes to `inner` and then fails, so a
+/// registry cannot stream past the size its descriptor declared.
+struct CappedWriter<W> {
+    inner: W,
+    remaining: u64,
     limit: u64,
 }
 
-impl CappedBuffer {
-    fn new(limit: u64) -> Self {
+impl<W> CappedWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
         Self {
-            bytes: Vec::new(),
+            inner,
+            remaining: limit,
             limit,
         }
     }
 
-    fn into_inner(self) -> Vec<u8> {
-        self.bytes
+    fn into_inner(self) -> W {
+        self.inner
     }
 }
 
-impl AsyncWrite for CappedBuffer {
+impl<W: AsyncWrite + Unpin> AsyncWrite for CappedWriter<W> {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let total = self.bytes.len() as u64 + buf.len() as u64;
-        if total > self.limit {
-            return Poll::Ready(Err(io::Error::other(format!(
-                "blob exceeds its declared size of {} bytes",
-                self.limit
-            ))));
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
         }
-        self.bytes.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
+        if self.remaining == 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("blob exceeds its declared size of {} bytes", self.limit),
+            )));
+        }
+        let allowed = usize::try_from(self.remaining).map_or(buf.len(), |r| r.min(buf.len()));
+        let written = match Pin::new(&mut self.inner).poll_write(cx, &buf[..allowed]) {
+            Poll::Ready(Ok(n)) => n,
+            other => return other,
+        };
+        self.remaining -= written as u64;
+        Poll::Ready(Ok(written))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -431,18 +452,21 @@ mod tests {
     }
 
     #[test]
-    fn capped_writer_rejects_more_than_the_limit() {
+    fn capped_writer_stops_at_the_limit() {
         use tokio::io::AsyncWriteExt;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let mut ok = CappedBuffer::new(4);
+            let mut ok = CappedWriter::new(Vec::new(), 4);
             ok.write_all(b"ab").await.unwrap();
             ok.write_all(b"cd").await.unwrap();
             assert_eq!(ok.into_inner(), b"abcd");
-            let mut over = CappedBuffer::new(3);
-            assert!(over.write_all(b"abcd").await.is_err());
+
+            let mut over = CappedWriter::new(Vec::new(), 4);
+            let err = over.write_all(b"abcde").await.unwrap_err();
+            assert!(err.to_string().contains("declared size of 4"), "{err}");
+            assert_eq!(over.into_inner(), b"abcd");
         });
     }
 }
