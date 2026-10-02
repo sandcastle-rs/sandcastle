@@ -81,7 +81,12 @@ fn layer_entries(out_dir: &std::path::Path) -> BTreeMap<String, (tar::EntryType,
     let mut map = BTreeMap::new();
     for entry in archive.entries().unwrap() {
         let mut entry = entry.unwrap();
-        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        let path = entry
+            .path()
+            .unwrap()
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_owned();
         let kind = entry.header().entry_type();
         let uid = entry.header().uid().unwrap();
         let body = match entry.link_name().unwrap() {
@@ -227,7 +232,12 @@ fn run_job_commits_changes_and_whiteouts() {
         entries.keys()
     );
     for stub in ["etc/resolv.conf", "etc/hosts", "dev", "proc", "sys"] {
-        assert!(!entries.contains_key(stub), "{stub} leaked into the layer");
+        assert!(
+            !entries
+                .keys()
+                .any(|k| k == stub || k.starts_with(&format!("{stub}/"))),
+            "{stub} leaked into the layer"
+        );
     }
 }
 

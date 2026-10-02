@@ -61,16 +61,22 @@ impl Layout {
         }
     }
 
-    /// Entries of layer `i`: path → (entry type, uid, contents or link target).
-    fn layer(&self, i: usize) -> BTreeMap<String, (tar::EntryType, u64, Vec<u8>)> {
+    /// Entries of layer `i`: path (trailing `/` trimmed) → (entry type, uid, contents or link target, mode).
+    fn layer(&self, i: usize) -> BTreeMap<String, (tar::EntryType, u64, Vec<u8>, u32)> {
         let gz = blob(&self.dir, self.manifest.layers()[i].digest().digest());
         let mut tar_bytes = Vec::new();
         GzDecoder::new(&gz[..]).read_to_end(&mut tar_bytes).unwrap();
         let mut map = BTreeMap::new();
         for entry in tar::Archive::new(&tar_bytes[..]).entries().unwrap() {
             let mut entry = entry.unwrap();
-            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let path = entry
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .trim_end_matches('/')
+                .to_owned();
             let (kind, uid) = (entry.header().entry_type(), entry.header().uid().unwrap());
+            let mode = entry.header().mode().unwrap();
             let body = match entry.link_name().unwrap() {
                 Some(t) => t.to_string_lossy().into_owned().into_bytes(),
                 None => {
@@ -79,7 +85,7 @@ impl Layout {
                     b
                 }
             };
-            map.insert(path, (kind, uid, body));
+            map.insert(path, (kind, uid, body, mode));
         }
         map
     }
@@ -150,28 +156,38 @@ fn alpine_build_produces_expected_image() {
     );
 
     let hello = layout.layer(base);
+    let hello_file = &hello["app/hello.txt"];
     assert_eq!(
-        hello["app/hello.txt"],
+        (hello_file.0, hello_file.1, &hello_file.2[..]),
         (
             tar::EntryType::Regular,
             0,
-            b"hello from the context\n".to_vec()
+            &b"hello from the context
+"[..]
         )
     );
     let tree = layout.layer(base + 1);
+    assert_eq!(tree["app/data/a.txt"].2, b"a\n");
     assert_eq!(tree["app/data/sub/b.txt"].2, b"b\n");
+    assert_eq!(
+        tree["app/data/run.sh"].3 & 0o777,
+        0o755,
+        "COPY keeps the executable bit"
+    );
     let confs = layout.layer(base + 2);
     assert!(confs.contains_key("etc/demo/one.conf") && confs.contains_key("etc/demo/two.conf"));
     let run = layout.layer(base + 3);
     assert!(run.contains_key("etc/.wh.motd"), "{:?}", run.keys());
     assert_eq!(run["app/greeting"].2, b"hello world\n");
+    let link = &run["app/link"];
     assert_eq!(
-        run["app/link"],
-        (tar::EntryType::Symlink, 0, b"greeting".to_vec())
+        (link.0, link.1, &link.2[..]),
+        (tar::EntryType::Symlink, 0, &b"greeting"[..])
     );
     assert!(layout.layer(base + 4).contains_key("sbin/tini"));
     assert_eq!(layout.layer(base + 5)["tmp/uid"].2, b"1234\n");
     for i in base..base + 6 {
+        let entries = layout.layer(i);
         for stub in [
             "etc/resolv.conf",
             "etc/hosts",
@@ -180,7 +196,12 @@ fn alpine_build_produces_expected_image() {
             "proc",
             "sys",
         ] {
-            assert!(!layout.layer(i).contains_key(stub), "{stub} in layer {i}");
+            assert!(
+                !entries
+                    .keys()
+                    .any(|k| k == stub || k.starts_with(&format!("{stub}/"))),
+                "{stub} in layer {i}"
+            );
         }
     }
 }
