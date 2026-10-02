@@ -22,9 +22,15 @@ jobs:
       - if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
         run: brew install lld xz e2fsprogs zstd
       - if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y patchelf libc6-dev e2fsprogs zstd binutils
+        run: sudo apt-get update && sudo apt-get install -y patchelf libc6-dev e2fsprogs zstd binutils clang libclang-dev
       - if: steps.cache.outputs.cache-hit != 'true'
         run: scripts/build-libs.sh lib
+      - name: Check bundle provenance
+        run: |
+          source scripts/libs.env
+          (cd lib && shasum -a 256 -c SHA256SUMS)
+          grep -qF "libkrun $LIBKRUN_TAG " lib/PROVENANCE
+          grep -qF "libkrunfw $LIBKRUNFW_TAG " lib/PROVENANCE
       - uses: actions/upload-artifact@v4
         with:
           name: sandcastle-libs-${{ matrix.platform }}

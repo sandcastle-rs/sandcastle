@@ -3,7 +3,7 @@
 # platform into the directory given as $1 (default: ./lib).
 #
 # macOS needs: brew install lld xz e2fsprogs zstd
-# Linux needs: apt-get install patchelf libc6-dev e2fsprogs zstd binutils
+# Linux needs: apt-get install patchelf libc6-dev e2fsprogs zstd binutils clang libclang-dev
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -98,6 +98,7 @@ python3 "$here/pack-sparse.py" "$work/store.ext4" | zstd -q -19 -o "$out/store-t
     echo "libkrun $LIBKRUN_TAG source sha256 $LIBKRUN_SRC_SHA256 (https://github.com/containers/libkrun)"
     echo "libkrunfw $LIBKRUNFW_TAG (https://github.com/containers/libkrunfw/tree/$LIBKRUNFW_TAG)"
     echo "built on $os $arch with make BLK=1"
+    echo "sha256 of every bundled file: see SHA256SUMS"
 } >"$out/PROVENANCE"
 (cd "$out" && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | sort | xargs shasum -a 256 >SHA256SUMS)
 ls -l "$out"
