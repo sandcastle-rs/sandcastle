@@ -64,7 +64,7 @@ crates/sandcastle-dockerfile/ (Dockerfile parser + typed instructions, no I/O)
 | `cli` | `sandcastle build [-f Dockerfile] -t <name> -o <oci-dir> <context>`; hidden `__vm <job.json>` subcommand used for the VM child process | clap |
 | `dockerfile` | Thin adapter: read the Dockerfile, call `sandcastle-dockerfile`, reject instructions outside the v1 scope with a line-numbered error | sandcastle-dockerfile |
 | `registry` | Resolve reference, select `linux/<host arch>` from an index, fetch manifest + config, stream layer blobs into the blob store (skip existing digests) | oci-client, oci-spec |
-| `store` | Owns the store root (`$SANDCASTLE_ROOT`, default `~/.local/share/sandcastle`): content-addressed `blobs/sha256/`, `store.ext4`, `guest-root/`, `jobs/`. Creates `store.ext4` once by expanding the bundled zstd-compressed empty ext4 template into a sparse file (64 GiB, zero runs become holes). Exclusive `flock` per build — ext4 cannot be mounted by two VMs. | zstd |
+| `store` | Owns the store root (`$SANDCASTLE_ROOT`, default `~/.local/share/sandcastle`): content-addressed `blobs/sha256/`, `store.ext4`, `guest-root/`, `jobs/`. Creates `store.ext4` once by expanding the bundled template (zstd-compressed list of non-zero extents of an empty 64 GiB ext4) into a sparse file; only the extents are written, everything else stays a hole. Exclusive `flock` per build — ext4 cannot be mounted by two VMs. | zstd |
 | `vm` | `ffi.rs`: hand-written `extern "C"` declarations for the ~10 libkrun calls used, loaded at runtime with `dlopen` (libloading) from `lib/` next to the executable, or `$SANDCASTLE_LIBKRUN_DIR`. No build-time link, so `cargo build`/`cargo test` work without libkrun. `run.rs`: spawns `sandcastle __vm`, inherits stdio, waits, reads `status.json`. The child configures the context, applies Landlock (Linux), calls `krun_start_enter`. All `unsafe` lives in `vm/ffi.rs` + the child setup function. | libloading, landlock (Linux) |
 | `image` | Build `ImageConfiguration` (env, cmd, entrypoint, workdir, user, labels, exposed ports, history, `rootfs.diff_ids`), gzip layer tars while hashing both uncompressed (diff_id) and compressed (digest) in one pass, write manifest, `index.json` (with `org.opencontainers.image.ref.name`), `oci-layout` | oci-spec, flate2, sha2 |
 | `build` | Orchestrates: iterate instructions, mutate config state, dispatch `RUN`/`COPY` jobs to `vm`, collect layers | all above |
@@ -231,9 +231,11 @@ notes link the exact libkrunfw source tag, and `NOTICE` lists all bundled
 licenses.
 
 The ext4 store template is produced in Linux CI with
-`mke2fs -t ext4 -E lazy_itable_init=1,lazy_journal_init=1` on a 64 GiB sparse
-file, then zstd-compressed (expected well under a few MB, since
-uninitialised tables are zeros).
+`mke2fs -t ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,nodiscard` on a
+64 GiB sparse file. Inode tables and journal are written as explicit zeros, so
+the kernel never starts a background zeroing pass that would inflate the
+sparse file. `scripts/pack-sparse.py` then records only the non-zero extents,
+and the result is zstd-compressed.
 
 For local development, `just fetch-libs` downloads the bundled libraries of
 the latest CI build into `lib/`.
