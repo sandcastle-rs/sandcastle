@@ -19,6 +19,12 @@ pub const OUT: &str = "/out";
 const CTX: &str = "/ctx";
 
 pub fn main() -> ! {
+    let mut args = std::env::args_os().skip(1);
+    if let Some(arg) = args.next()
+        && arg == crate::run::EXEC_ARG
+    {
+        crate::run::exec_main(args.next())
+    }
     match job_main() {
         Ok(code) => process::exit(code),
         Err(e) => {
@@ -67,7 +73,7 @@ fn run_job(job: Job, out: &Path) -> Result<Status> {
             ..Default::default()
         }),
         Job::Copy(job) => with_store(|store| copy_job(store, &job, out)),
-        Job::Run(_) => anyhow::bail!("job not supported by this helper"),
+        Job::Run(job) => with_store(|store| crate::run::run_job(store, &job, out)),
     }
 }
 

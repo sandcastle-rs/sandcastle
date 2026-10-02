@@ -18,6 +18,8 @@ mod overlay;
 #[cfg(target_os = "linux")]
 mod probe;
 #[cfg(target_os = "linux")]
+mod run;
+#[cfg(target_os = "linux")]
 mod store;
 #[cfg(target_os = "linux")]
 mod unpack;

@@ -9,7 +9,7 @@ use sandcastle::install::Install;
 use sandcastle::registry;
 use sandcastle::store::Store;
 use sandcastle::vm::{Resources, Vm};
-use sandcastle_proto::{CopyJob, Job, LAYER_FILE, LowerLayer, Status};
+use sandcastle_proto::{CopyJob, Job, LAYER_FILE, LowerLayer, RunJob, Status};
 
 fn sandcastle_bin() -> PathBuf {
     std::env::var_os("SANDCASTLE_BIN")
@@ -159,4 +159,261 @@ fn copy_job_missing_source_is_a_guest_error() {
         format!("{err:#}").contains("nope.txt: not found in the build context"),
         "{err:#}"
     );
+}
+
+fn run_job(lower: Vec<LowerLayer>, script: &str, user: &str) -> Job {
+    Job::Run(RunJob {
+        lower,
+        argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+        env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".into()],
+        user: user.into(),
+        workdir: "/work".into(),
+        resolv_conf: "nameserver 8.8.8.8\n".into(),
+    })
+}
+
+/// Runs `job` and, if it made a layer, returns the lower stack with it on top.
+fn run_step(
+    vm: &Vm,
+    store: &Store,
+    lower: &[LowerLayer],
+    job: &Job,
+) -> (sandcastle::vm::Finished, Vec<LowerLayer>) {
+    let finished = vm.run(job, None).unwrap();
+    let mut stack = lower.to_vec();
+    if let Some(diff_id) = &finished.status.layer {
+        // Ingest the layer so later jobs can find it as a blob too.
+        let blobs = store.blobs();
+        let mut writer = sandcastle::image::LayerWriter::new(&blobs).unwrap();
+        std::io::copy(
+            &mut std::fs::File::open(finished.out_dir().join(LAYER_FILE)).unwrap(),
+            &mut writer,
+        )
+        .unwrap();
+        let layer = writer.finish().unwrap();
+        assert_eq!(layer.diff_id.to_string(), *diff_id);
+        stack.push(LowerLayer {
+            diff_id: diff_id.clone(),
+            blob: layer.descriptor.digest().to_string(),
+            media_type: sandcastle_proto::LAYER_TAR_GZIP.into(),
+        });
+    }
+    (finished, stack)
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn run_job_commits_changes_and_whiteouts() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let base = busybox(&store);
+    let job = run_job(
+        base.clone(),
+        "echo hi > out.txt && rm /etc/group && ls /dev/null /proc/self >/dev/null",
+        "",
+    );
+    let (finished, _) = run_step(&vm, &store, &base, &job);
+    assert_eq!(finished.status.exit_code, 0);
+    let entries = layer_entries(&finished.out_dir());
+    assert_eq!(entries["work/out.txt"].2, b"hi\n");
+    assert!(
+        entries.contains_key("etc/.wh.group"),
+        "{:?}",
+        entries.keys()
+    );
+    for stub in ["etc/resolv.conf", "etc/hosts", "dev", "proc", "sys"] {
+        assert!(!entries.contains_key(stub), "{stub} leaked into the layer");
+    }
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn run_job_exit_codes_and_no_op_steps() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let base = busybox(&store);
+    let status = vm
+        .run(&run_job(base.clone(), "exit 3", ""), None)
+        .unwrap()
+        .status
+        .clone();
+    assert_eq!((status.exit_code, status.layer), (3, None));
+    let mut job = run_job(base.clone(), "", "");
+    if let Job::Run(r) = &mut job {
+        r.argv = vec!["/no/such/binary".into()];
+    }
+    assert_eq!(vm.run(&job, None).unwrap().status.exit_code, 127);
+    let mut noop = run_job(base, "true", "");
+    if let Job::Run(r) = &mut noop {
+        r.workdir = "/".into();
+    }
+    let status = vm.run(&noop, None).unwrap().status.clone();
+    assert_eq!((status.exit_code, status.layer), (0, None));
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn run_job_drops_to_user() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let base = busybox(&store);
+    let job = run_job(
+        base.clone(),
+        "id -u > /tmp/uid; echo $HOME > /tmp/home",
+        "65534",
+    );
+    let (finished, _) = run_step(&vm, &store, &base, &job);
+    let entries = layer_entries(&finished.out_dir());
+    assert_eq!(entries["tmp/uid"].2, b"65534\n");
+    assert_eq!(entries["tmp/home"].2, b"/home\n");
+    let err = vm.run(&run_job(base, "true", "ghost"), None).err().unwrap();
+    assert!(
+        format!("{err:#}").contains("unable to find user ghost"),
+        "{err:#}"
+    );
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn run_kills_leftover_processes() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let base = busybox(&store);
+    let status = vm
+        .run(
+            &run_job(base, "sleep 1000 & echo started > /started", ""),
+            None,
+        )
+        .unwrap()
+        .status
+        .clone();
+    assert_eq!(status.exit_code, 0);
+    assert!(status.layer.is_some());
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn opaque_dir_hides_lower_contents() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let base = busybox(&store);
+    let (_, stack) = run_step(
+        &vm,
+        &store,
+        &base,
+        &run_job(base.clone(), "mkdir /d && touch /d/a /d/b", ""),
+    );
+    let (finished, stack) = run_step(
+        &vm,
+        &store,
+        &stack,
+        &run_job(stack.clone(), "rm -rf /d && mkdir /d && touch /d/c", ""),
+    );
+    assert!(layer_entries(&finished.out_dir()).contains_key("d/.wh..wh..opq"));
+    let (finished, _) = run_step(
+        &vm,
+        &store,
+        &stack,
+        &run_job(stack.clone(), "ls /d > /listing", ""),
+    );
+    assert_eq!(layer_entries(&finished.out_dir())["listing"].2, b"c\n");
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn run_survives_resolv_conf_symlink() {
+    // A RUN cannot replace /etc/resolv.conf (it is a bind mount during the
+    // step), so the dangling link comes from a COPY layer, as from a base image.
+    let (dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let base = busybox(&store);
+    let ctx = dir.path().join("ctx");
+    std::fs::create_dir_all(ctx.join("root/etc")).unwrap();
+    std::os::unix::fs::symlink("/nonexistent", ctx.join("root/etc/resolv.conf")).unwrap();
+    let copy = Job::Copy(CopyJob {
+        lower: base.clone(),
+        sources: vec!["root".into()],
+        dest: "/".into(),
+        workdir: "/".into(),
+    });
+    let finished = vm.run(&copy, Some(&ctx)).unwrap();
+    let mut stack = base;
+    let diff_id = finished.status.layer.clone().unwrap();
+    let blobs = store.blobs();
+    let mut writer = sandcastle::image::LayerWriter::new(&blobs).unwrap();
+    std::io::copy(
+        &mut std::fs::File::open(finished.out_dir().join(LAYER_FILE)).unwrap(),
+        &mut writer,
+    )
+    .unwrap();
+    let layer = writer.finish().unwrap();
+    stack.push(LowerLayer {
+        diff_id,
+        blob: layer.descriptor.digest().to_string(),
+        media_type: sandcastle_proto::LAYER_TAR_GZIP.into(),
+    });
+    let status = vm
+        .run(&run_job(stack, "echo ok > /ok", ""), None)
+        .unwrap()
+        .status
+        .clone();
+    assert_eq!(status.exit_code, 0);
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn run_cannot_reach_the_store_disk() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let base = busybox(&store);
+    let script = "mknod /tmp/vda b 254 0 2>/dev/null || echo blocked > /m1; \
+                  mkdir -p /mnt; mount -t tmpfs none /mnt 2>/dev/null || echo blocked > /m2; \
+                  touch /f && chown 65534 /f && echo ok > /m3";
+    let (finished, _) = run_step(&vm, &store, &base, &run_job(base.clone(), script, ""));
+    assert_eq!(finished.status.exit_code, 0);
+    let entries = layer_entries(&finished.out_dir());
+    for marker in ["m1", "m2", "m3"] {
+        assert!(
+            entries.contains_key(marker),
+            "{marker} missing: {:?}",
+            entries.keys()
+        );
+    }
+    assert_eq!(entries["m1"].2, b"blocked\n");
+    assert_eq!(entries["m2"].2, b"blocked\n");
 }
