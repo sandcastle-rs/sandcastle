@@ -2,8 +2,9 @@
 //! built, gzip layer blobs, and the OCI image layout written at the end.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
+use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, ensure};
@@ -11,8 +12,10 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use oci_spec::image::{
     Arch, ConfigBuilder, Descriptor, Digest, History, HistoryBuilder, ImageConfiguration,
-    ImageConfigurationBuilder, MediaType, Os, RootFsBuilder,
+    ImageConfigurationBuilder, ImageIndexBuilder, ImageManifestBuilder, MediaType, Os,
+    RootFsBuilder,
 };
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
@@ -242,10 +245,78 @@ impl Write for LayerWriter<'_, '_> {
     }
 }
 
+/// Annotation tools such as skopeo and podman use to find an image in a layout.
+pub const REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
+const SCHEMA_VERSION: u32 = 2;
+const OCI_LAYOUT: &[u8] = br#"{"imageLayoutVersion":"1.0.0"}"#;
+
+/// Serializes with sorted object keys, so equal values give equal digests.
+pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::to_value(value)?)?)
+}
+
+/// Writes `state` as the single image of an OCI layout at `out_dir`, named
+/// `ref_name`. An existing layout is updated in place: blobs are content
+/// addressed, and `index.json` is replaced to point at this image only.
+pub fn write_layout(
+    blobs: &BlobStore<'_>,
+    state: &ConfigState,
+    out_dir: &Path,
+    ref_name: &str,
+) -> Result<Descriptor> {
+    let config = blobs.put_bytes(
+        MediaType::ImageConfig,
+        &canonical_json(&state.to_configuration()?)?,
+    )?;
+    let manifest = ImageManifestBuilder::default()
+        .schema_version(SCHEMA_VERSION)
+        .media_type(MediaType::ImageManifest)
+        .config(config.clone())
+        .layers(state.layers.clone())
+        .build()?;
+    let mut manifest_desc =
+        blobs.put_bytes(MediaType::ImageManifest, &canonical_json(&manifest)?)?;
+
+    let out_blobs = out_dir.join("blobs").join("sha256");
+    fs::create_dir_all(&out_blobs).with_context(|| format!("creating {}", out_blobs.display()))?;
+    for desc in state.layers.iter().chain([&config, &manifest_desc]) {
+        let dest = out_blobs.join(desc.digest().digest());
+        if !dest.exists() {
+            let src = blobs.path(desc.digest())?;
+            // fs::copy clones on APFS and uses copy_file_range on Linux.
+            let partial = dest.with_extension("partial");
+            fs::copy(&src, &partial)
+                .with_context(|| format!("copying blob {} into the layout", desc.digest()))?;
+            fs::rename(&partial, &dest)?;
+        }
+    }
+
+    write_atomic(&out_dir.join("oci-layout"), OCI_LAYOUT)?;
+    manifest_desc.set_annotations(Some(HashMap::from([(
+        REF_NAME_ANNOTATION.to_string(),
+        ref_name.to_string(),
+    )])));
+    let index = ImageIndexBuilder::default()
+        .schema_version(SCHEMA_VERSION)
+        .media_type(MediaType::ImageIndex)
+        .manifests(vec![manifest_desc.clone()])
+        .build()?;
+    write_atomic(&out_dir.join("index.json"), &canonical_json(&index)?)?;
+    Ok(manifest_desc)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes).with_context(|| format!("writing {}", path.display()))?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::{Read, Write};
+    use std::path::Path;
 
     use super::*;
     use crate::blobs::sha256;
@@ -373,6 +444,118 @@ mod tests {
                 (Some("RUN true".to_string()), None),
                 (Some("ENV A=b".to_string()), Some(true))
             ]
+        );
+    }
+
+    use oci_spec::image::{ImageIndex, ImageManifest};
+
+    fn built_state(blobs: &BlobStore<'_>, cmd: &str) -> ConfigState {
+        let mut base = docker_config();
+        base.rootfs_mut().set_diff_ids(vec![]);
+        let mut state = ConfigState::from_base(&base, vec![]).unwrap();
+        let mut writer = LayerWriter::new(blobs).unwrap();
+        writer.write_all(b"layer contents").unwrap();
+        state
+            .add_layer(writer.finish().unwrap(), "RUN make")
+            .unwrap();
+        state.cmd = Some(vec![cmd.to_string()]);
+        state
+    }
+
+    /// Re-hashes a blob in the layout and checks it against its descriptor.
+    fn read_verified(out: &Path, desc: &Descriptor) -> Vec<u8> {
+        let bytes = fs::read(out.join("blobs/sha256").join(desc.digest().digest())).unwrap();
+        assert_eq!(&sha256(&bytes), desc.digest());
+        assert_eq!(bytes.len() as u64, desc.size());
+        bytes
+    }
+
+    #[test]
+    fn write_layout_produces_verifiable_layout() {
+        let (dir, store) = test_support::store();
+        let blobs = store.blobs();
+        let state = built_state(&blobs, "app");
+        let out = dir.path().join("out layout");
+        write_layout(&blobs, &state, &out, "demo").unwrap();
+
+        let layout: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("oci-layout")).unwrap()).unwrap();
+        assert_eq!(layout["imageLayoutVersion"], "1.0.0");
+        let index = ImageIndex::from_file(out.join("index.json")).unwrap();
+        assert_eq!(index.manifests().len(), 1);
+        let entry = &index.manifests()[0];
+        assert_eq!(entry.media_type(), &MediaType::ImageManifest);
+        assert_eq!(
+            entry.annotations().as_ref().unwrap()[REF_NAME_ANNOTATION],
+            "demo"
+        );
+
+        let manifest = ImageManifest::from_reader(&read_verified(&out, entry)[..]).unwrap();
+        assert_eq!(manifest.config().media_type(), &MediaType::ImageConfig);
+        let config =
+            ImageConfiguration::from_reader(&read_verified(&out, manifest.config())[..]).unwrap();
+        assert_eq!(
+            config.rootfs().diff_ids(),
+            &vec![state.diff_ids[0].to_string()]
+        );
+        assert_eq!(
+            config.config().as_ref().unwrap().cmd(),
+            &Some(vec!["app".to_string()])
+        );
+        assert_eq!(manifest.layers().len(), 1);
+        read_verified(&out, &manifest.layers()[0]);
+    }
+
+    #[test]
+    fn rewriting_layout_points_index_at_latest_image() {
+        let (dir, store) = test_support::store();
+        let blobs = store.blobs();
+        let out = dir.path().join("out");
+        let first = write_layout(&blobs, &built_state(&blobs, "one"), &out, "demo").unwrap();
+        let second = write_layout(&blobs, &built_state(&blobs, "two"), &out, "demo").unwrap();
+        assert_ne!(first.digest(), second.digest());
+        let index = ImageIndex::from_file(out.join("index.json")).unwrap();
+        assert_eq!(index.manifests().len(), 1);
+        assert_eq!(index.manifests()[0].digest(), second.digest());
+        read_verified(&out, &index.manifests()[0]);
+    }
+
+    #[test]
+    fn config_json_is_identical_for_identical_state() {
+        let (_dir, store) = test_support::store();
+        let blobs = store.blobs();
+        let mut state = built_state(&blobs, "app");
+        for i in 0..32 {
+            state.labels.insert(format!("label.{i}"), i.to_string());
+        }
+        // Each conversion builds a new HashMap with its own random iteration order.
+        let a = canonical_json(&state.to_configuration().unwrap()).unwrap();
+        let b = canonical_json(&state.to_configuration().unwrap()).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_at_every_level() {
+        let owned: Vec<String> = (0..16).map(|i| format!("k{i:02}")).collect();
+        let keys: Vec<&str> = owned.iter().map(String::as_str).collect();
+        fn outer<'a>(order: &[&'a str]) -> HashMap<&'static str, HashMap<&'a str, &'static str>> {
+            let inner: HashMap<&str, &str> = order.iter().map(|k| (*k, "v")).collect();
+            HashMap::from([("z", inner.clone()), ("a", inner)])
+        }
+        let forward = canonical_json(&outer(&keys)).unwrap();
+        let reversed: Vec<&str> = keys.iter().rev().copied().collect();
+        let backward = canonical_json(&outer(&reversed)).unwrap();
+        assert_eq!(forward, backward);
+        let expected_inner = format!(
+            "{{{}}}",
+            keys.iter()
+                .map(|k| format!("\"{k}\":\"v\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(
+            String::from_utf8(forward).unwrap(),
+            format!("{{\"a\":{expected_inner},\"z\":{expected_inner}}}")
         );
     }
 }
