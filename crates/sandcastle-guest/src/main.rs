@@ -1,5 +1,8 @@
 //! Static helper executed by libkrun's init inside every sandcastle microVM.
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod layer;
+
 #[cfg(target_os = "linux")]
 mod linux;
 
