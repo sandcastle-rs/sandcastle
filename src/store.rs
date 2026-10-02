@@ -13,8 +13,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::blobs::BlobStore;
 use crate::install::Install;
 
-/// Path of the guest helper inside the VM (relative to the guest root).
-pub const GUEST_HELPER_PATH: &str = "/sandcastle-guest";
+pub use sandcastle_proto::GUEST_HELPER_PATH;
 /// Mount points libkrun's init and the guest helper expect on the root share.
 const GUEST_DIRS: &[&str] = &["dev", "proc", "sys", "tmp", "out", "store"];
 /// Largest single template record accepted, bounding the read buffer.

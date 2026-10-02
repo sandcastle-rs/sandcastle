@@ -114,7 +114,7 @@ mod tests {
             Some(127),
             Some(Status {
                 exit_code: 127,
-                probe: None,
+                ..Default::default()
             }),
         )
         .unwrap();

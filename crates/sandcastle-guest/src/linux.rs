@@ -31,7 +31,9 @@ fn run() -> Result<i32> {
         Job::Probe { exit_code } => Status {
             exit_code,
             probe: Some(crate::probe::run()?),
+            ..Default::default()
         },
+        Job::Run(_) | Job::Copy(_) => anyhow::bail!("job not supported by this helper"),
     };
     // Write-then-rename so the host never sees a partial status.
     let tmp = out.join(format!("{STATUS_FILE}.tmp"));
