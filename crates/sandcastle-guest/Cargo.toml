@@ -1,0 +1,13 @@
+[package]
+name = "sandcastle-guest"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+serde_json = "1.0.151"
+sandcastle-proto = { path = "../sandcastle-proto" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", features = ["mount", "system"] }

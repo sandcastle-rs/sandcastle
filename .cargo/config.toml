@@ -1,0 +1,7 @@
+# The guest helper is a static musl binary; rust-lld links it on any host,
+# including macOS, without a Linux cross toolchain.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"

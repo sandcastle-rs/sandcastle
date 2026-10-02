@@ -1,0 +1,8 @@
+sandcastle release archives bundle third-party components in lib/:
+
+- libkrun (https://github.com/containers/libkrun), Apache-2.0,
+  lib/licenses/LICENSE-libkrun.
+- libkrunfw (https://github.com/containers/libkrunfw), library code
+  LGPL-2.1-only; embedded Linux kernel GPL-2.0-only. Licenses in
+  lib/licenses/. The exact source tag is recorded in lib/PROVENANCE;
+  kernel source and patches are available from that libkrunfw tag.
