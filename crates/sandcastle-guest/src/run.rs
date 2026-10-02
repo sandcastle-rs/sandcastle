@@ -3,13 +3,13 @@
 
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, ErrorKind};
+use std::io::{self, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Stdio};
 
-use anyhow::{Context, Result};
-use rustix::fs::{CWD, FileType, Mode, makedev, mknodat};
+use anyhow::{Context, Result, ensure};
+use rustix::fs::{CWD, FileType, Mode, OFlags, makedev, mknodat};
 use rustix::io::Errno;
 use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_bind, mount_change,
@@ -160,12 +160,32 @@ fn exit_code(status: ExitStatus) -> i32 {
 
 /// Reads a file of the image, resolving links inside the image root.
 fn read_in_root(root: &Path, path: &str) -> Result<String> {
-    match fs::read_to_string(resolve_in_root(root, Path::new(path))?) {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(e).with_context(|| format!("reading {path}")),
-    }
+    let resolved = resolve_in_root(root, Path::new(path))?;
+    let fd = match rustix::fs::open(
+        &resolved,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(String::new()),
+        Err(e) => return Err(e).with_context(|| format!("opening {path}")),
+    };
+    let file = File::from(fd);
+    let meta = file.metadata().with_context(|| format!("reading {path}"))?;
+    ensure!(meta.is_file(), "{path} is not a regular file");
+    let mut text = String::new();
+    file.take(MAX_ID_FILE + 1)
+        .read_to_string(&mut text)
+        .with_context(|| format!("reading {path}"))?;
+    ensure!(
+        text.len() as u64 <= MAX_ID_FILE,
+        "{path} is larger than {MAX_ID_FILE} bytes"
+    );
+    Ok(text)
 }
+
+/// Upper bound for `/etc/passwd` and `/etc/group`, which the guest parses.
+const MAX_ID_FILE: u64 = 4 << 20;
 
 /// Entry point of `sandcastle-guest --exec <spec>`.
 pub fn exec_main(spec: Option<OsString>) -> ! {

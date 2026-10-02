@@ -285,33 +285,47 @@ impl Copy<'_> {
         let meta = fs::symlink_metadata(src)?;
         let ft = meta.file_type();
         let mut created = true;
-        match fs::symlink_metadata(dst) {
+        let mut dst = dst.to_path_buf();
+        match fs::symlink_metadata(&dst) {
             Ok(existing) if existing.is_dir() && ft.is_dir() => created = false,
+            Ok(existing) if existing.file_type().is_symlink() && ft.is_dir() => {
+                let rel = dst
+                    .strip_prefix(self.root)
+                    .context("destination leaves the image root")?;
+                let resolved = resolve_in_root(self.root, &Path::new("/").join(rel))?;
+                ensure!(
+                    fs::metadata(&resolved).is_ok_and(|m| m.is_dir()),
+                    "cannot copy directory onto non-directory {}",
+                    self.shown(&dst)
+                );
+                dst = resolved;
+                created = false;
+            }
             Ok(existing) if existing.is_dir() => bail!(
                 "cannot replace directory {} with a non-directory",
-                self.shown(dst)
+                self.shown(&dst)
             ),
-            Ok(_) => fs::remove_file(dst)?,
+            Ok(_) => fs::remove_file(&dst)?,
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
         if ft.is_dir() {
             if created {
-                fs::create_dir(dst)?;
+                fs::create_dir(&dst)?;
             }
-            self.copy_children(src, dst)?;
+            self.copy_children(src, &dst)?;
             if created {
-                self.finish(dst, &meta)?;
+                self.finish(&dst, &meta)?;
             }
         } else if ft.is_file() {
             let mut from = File::open(src)?;
-            let mut to = File::create_new(dst)?;
+            let mut to = File::create_new(&dst)?;
             io::copy(&mut from, &mut to).with_context(|| format!("copying {}", src.display()))?;
             drop(to);
-            self.finish(dst, &meta)?;
+            self.finish(&dst, &meta)?;
         } else if ft.is_symlink() {
-            symlink(fs::read_link(src)?, dst)?;
-            self.chown(dst)?;
+            symlink(fs::read_link(src)?, &dst)?;
+            self.chown(&dst)?;
         } else {
             eprintln!("sandcastle-guest: skipping special file {}", src.display());
         }
@@ -397,6 +411,35 @@ mod tests {
         );
         symlink("loop", f.root.join("loop")).unwrap();
         assert!(resolve_in_root(&f.root, Path::new("loop")).is_err());
+    }
+
+    #[test]
+    fn dir_onto_symlinked_dir_merges_into_target() {
+        let f = fixture();
+        fs::write(f.root.join("usr/bin/sh"), "sh").unwrap();
+        fs::create_dir_all(f.ctx.join("tree2/bin")).unwrap();
+        fs::write(f.ctx.join("tree2/bin/x"), "x").unwrap();
+        copy(&f, "/").run(&["tree2".into()], "/").unwrap();
+        assert!(f.root.join("usr/bin/x").is_file());
+        assert!(f.root.join("usr/bin/sh").is_file());
+        assert!(
+            fs::symlink_metadata(f.root.join("bin"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn dir_onto_symlink_to_non_directory_is_an_error() {
+        let f = fixture();
+        fs::write(f.root.join("file"), "f").unwrap();
+        symlink("file", f.root.join("lnk")).unwrap();
+        fs::create_dir_all(f.ctx.join("tree3/lnk")).unwrap();
+        let err = copy(&f, "/").run(&["tree3".into()], "/").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot copy directory onto non-directory")
+        );
     }
 
     #[test]

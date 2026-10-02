@@ -54,10 +54,10 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
         /// vCPUs per build-step VM [default: all host CPUs].
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..))]
         cpus: Option<u8>,
         /// Memory per build-step VM, in MiB.
-        #[arg(long, default_value_t = 2048)]
+        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..))]
         memory: u32,
     },
     /// Internal: configure and enter a microVM for one job.

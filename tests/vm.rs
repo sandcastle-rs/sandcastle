@@ -402,6 +402,26 @@ fn run_survives_resolv_conf_symlink() {
 
 #[test]
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn run_creating_a_reserved_whiteout_name_fails_the_step() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let base = busybox(&store);
+    let Err(err) = vm.run(&run_job(base, "touch /.wh.foo", ""), None) else {
+        panic!("the step should fail");
+    };
+    assert!(
+        format!("{err:#}").contains("names starting with .wh. are reserved for whiteouts"),
+        "{err:#}"
+    );
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn run_cannot_reach_the_store_disk() {
     let (_dir, exe, install, store) = store();
     let vm = Vm {
@@ -414,7 +434,6 @@ fn run_cannot_reach_the_store_disk() {
     let script = "mknod /tmp/vda b 254 0 2>/dev/null || echo blocked > /m1; \
                   mkdir -p /mnt; mount -t tmpfs none /mnt 2>/dev/null || echo blocked > /m2; \
                   touch /f && chown 65534 /f && echo ok > /m3; \
-                  mkdir /x && chroot /x /bin/true 2>/dev/null; \
                   grep -c ' /store' /proc/self/mountinfo > /m4; \
                   test ! -e /store/layers && echo ok > /m6; \
                   echo x > /proc/sys/kernel/core_pattern 2>/dev/null || echo blocked > /m5";

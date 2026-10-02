@@ -159,12 +159,7 @@ fn alpine_build_produces_expected_image() {
     let hello_file = &hello["app/hello.txt"];
     assert_eq!(
         (hello_file.0, hello_file.1, &hello_file.2[..]),
-        (
-            tar::EntryType::Regular,
-            0,
-            &b"hello from the context
-"[..]
-        )
+        (tar::EntryType::Regular, 0, &b"hello from the context\n"[..])
     );
     let tree = layout.layer(base + 1);
     assert_eq!(tree["app/data/a.txt"].2, b"a\n");

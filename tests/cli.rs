@@ -61,3 +61,19 @@ fn build_reports_missing_dockerfile() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Nope"));
 }
+
+#[test]
+fn build_rejects_zero_cpus_and_memory() {
+    for flag in ["--cpus", "--memory"] {
+        let output = sandcastle()
+            .args(["build", "-t", "demo", "-o", "out", flag, "0", "."])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(flag) && stderr.contains("not in 1.."),
+            "{stderr}"
+        );
+    }
+}

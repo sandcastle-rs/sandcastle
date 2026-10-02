@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rustix::fs::{lgetxattr, llistxattr, major, minor};
 
 use crate::layer::{self, HashWriter, Kind, Meta, OPAQUE_XATTR, OVERLAY_XATTR_PREFIX};
@@ -80,6 +81,13 @@ fn walk<W: Write>(
             size: 0,
             xattrs,
         };
+        let is_whiteout = ft.is_char_device() && meta.rdev() == 0;
+        if !is_whiteout && !ft.is_socket() && name.as_bytes().starts_with(b".wh.") {
+            bail!(
+                "RUN created /{}: names starting with .wh. are reserved for whiteouts",
+                rel.display()
+            );
+        }
         let kind = if ft.is_dir() {
             Kind::Dir { opaque }
         } else if ft.is_char_device() && meta.rdev() == 0 {

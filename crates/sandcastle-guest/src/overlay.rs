@@ -75,9 +75,7 @@ impl Overlay {
 
     /// Unmounts and returns the upper dir, now an ordinary directory.
     pub fn unmount(self) -> Result<PathBuf> {
-        unmount(&self.merged, UnmountFlags::empty())
-            .or_else(|_| unmount(&self.merged, UnmountFlags::DETACH))
-            .context("unmounting the overlay")?;
+        unmount(&self.merged, UnmountFlags::empty()).context("unmounting the overlay")?;
         Ok(self.upper)
     }
 }
