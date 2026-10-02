@@ -7,7 +7,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use oci_spec::image::{
@@ -15,6 +15,7 @@ use oci_spec::image::{
     ImageConfigurationBuilder, ImageIndexBuilder, ImageManifestBuilder, MediaType, Os,
     RootFsBuilder,
 };
+use sandcastle_proto::{LAYER_TAR, LAYER_TAR_GZIP, LowerLayer};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
@@ -98,6 +99,30 @@ impl ConfigState {
             layers,
             diff_ids,
         })
+    }
+
+    /// The layer stack as guest jobs take it, bottom first. Only layer
+    /// formats the guest can unpack are accepted.
+    pub fn lower_layers(&self) -> Result<Vec<LowerLayer>> {
+        self.layers
+            .iter()
+            .zip(&self.diff_ids)
+            .map(|(desc, diff_id)| {
+                let media_type = match desc.media_type() {
+                    MediaType::ImageLayer => LAYER_TAR,
+                    MediaType::ImageLayerGzip => LAYER_TAR_GZIP,
+                    other => bail!(
+                        "layer {} is {other}; sandcastle can only unpack uncompressed and gzip layers (zstd is not supported yet)",
+                        desc.digest()
+                    ),
+                };
+                Ok(LowerLayer {
+                    diff_id: diff_id.to_string(),
+                    blob: desc.digest().to_string(),
+                    media_type: media_type.to_string(),
+                })
+            })
+            .collect()
     }
 
     pub fn add_layer(&mut self, layer: Layer, created_by: &str) -> Result<()> {
@@ -394,6 +419,27 @@ mod tests {
         assert_eq!(state.stop_signal.as_deref(), Some("SIGQUIT"));
         assert_eq!(state.history.len(), 2);
         assert_eq!(state.diff_ids.len(), 1);
+    }
+
+    #[test]
+    fn lower_layers_map_media_types_and_reject_zstd() {
+        let d =
+            |n: u8| Digest::from_str(&format!("sha256:{}", format!("{n:02x}").repeat(32))).unwrap();
+        let mut state = ConfigState::from_base(&docker_config(), vec![base_layer()]).unwrap();
+        state.layers = vec![
+            Descriptor::new(MediaType::ImageLayerGzip, 1, d(1)),
+            Descriptor::new(MediaType::ImageLayer, 1, d(2)),
+        ];
+        state.diff_ids = vec![d(3), d(4)];
+        let lower = state.lower_layers().unwrap();
+        assert_eq!(lower[0].media_type, sandcastle_proto::LAYER_TAR_GZIP);
+        assert_eq!(lower[0].blob, d(1).to_string());
+        assert_eq!(lower[1].diff_id, d(4).to_string());
+        assert_eq!(lower[1].media_type, sandcastle_proto::LAYER_TAR);
+
+        state.layers[1] = Descriptor::new(MediaType::ImageLayerZstd, 1, d(2));
+        let err = state.lower_layers().unwrap_err();
+        assert!(format!("{err:#}").contains("zstd"), "{err:#}");
     }
 
     #[test]

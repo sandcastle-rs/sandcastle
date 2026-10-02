@@ -4,13 +4,23 @@ use std::path::PathBuf;
 
 use sandcastle::install::Install;
 use sandcastle::store::Store;
-use sandcastle::vm::run_job;
-use sandcastle_proto::Job;
+use sandcastle::vm::{Resources, Vm};
+use sandcastle_proto::{Job, Status};
 
 fn sandcastle_bin() -> PathBuf {
     std::env::var_os("SANDCASTLE_BIN")
         .expect("SANDCASTLE_BIN must point at the signed sandcastle binary")
         .into()
+}
+
+fn run(exe: &std::path::Path, install: &Install, store: &Store, job: &Job) -> Status {
+    let vm = Vm {
+        exe,
+        install,
+        store,
+        resources: Resources::default(),
+    };
+    vm.run(job, None).unwrap().status.clone()
 }
 
 /// A store under a directory with a space, as on many macOS setups.
@@ -26,7 +36,7 @@ fn store() -> (tempfile::TempDir, PathBuf, Install, Store) {
 #[ignore = "needs bundled libkrun and a hypervisor; run with `just it`"]
 fn probe_mounts_store_and_supports_overlay_lowerdir_plus() {
     let (_dir, exe, install, store) = store();
-    let status = run_job(&exe, &store, &install, &Job::Probe { exit_code: 0 }).unwrap();
+    let status = run(&exe, &install, &store, &Job::Probe { exit_code: 0 });
     assert_eq!(status.exit_code, 0);
     let probe = status.probe.expect("probe report");
     assert!(!probe.kernel_release.is_empty());
@@ -41,7 +51,7 @@ fn probe_mounts_store_and_supports_overlay_lowerdir_plus() {
 #[ignore = "needs bundled libkrun and a hypervisor; run with `just it`"]
 fn guest_exit_127_comes_from_status_file() {
     let (_dir, exe, install, store) = store();
-    let status = run_job(&exe, &store, &install, &Job::Probe { exit_code: 127 }).unwrap();
+    let status = run(&exe, &install, &store, &Job::Probe { exit_code: 127 });
     assert_eq!(status.exit_code, 127);
     assert!(
         status.probe.is_some(),

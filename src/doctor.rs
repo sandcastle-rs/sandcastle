@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::install::Install;
 use crate::store::Store;
-use crate::vm::run_job;
+use crate::vm::{Resources, Vm};
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -41,7 +41,13 @@ pub fn run(exe: &Path, install: &Install, store_root: &Path) -> Result<Report> {
     #[cfg(target_os = "linux")]
     check_kvm(Path::new("/dev/kvm"))?;
     let store = Store::open(store_root, install)?;
-    let status = run_job(exe, &store, install, &Job::Probe { exit_code: 0 })?;
+    let vm = Vm {
+        exe,
+        install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let status = vm.run(&Job::Probe { exit_code: 0 }, None)?.status.clone();
     if status.exit_code != 0 {
         bail!("guest probe exited with {}", status.exit_code);
     }

@@ -15,7 +15,7 @@ use crate::install::Install;
 
 pub use sandcastle_proto::GUEST_HELPER_PATH;
 /// Mount points libkrun's init and the guest helper expect on the root share.
-const GUEST_DIRS: &[&str] = &["dev", "proc", "sys", "tmp", "out", "store"];
+const GUEST_DIRS: &[&str] = &["dev", "proc", "sys", "tmp", "out", "store", "blobs", "ctx"];
 /// Largest single template record accepted, bounding the read buffer.
 const MAX_EXTENT: u32 = 64 << 20;
 const TEMPLATE_MAGIC: &[u8; 4] = b"SCX1";
@@ -46,6 +46,11 @@ impl Store {
             }
             Err(TryLockError::Error(e)) => return Err(e).context("locking the store"),
         }
+        // `__vm` children inherit the lock, so a VM that outlives this
+        // process keeps the store locked instead of sharing the ext4 disk
+        // with the next build.
+        rustix::io::fcntl_setfd(&lock, rustix::io::FdFlags::empty())
+            .context("making the store lock inheritable")?;
 
         let jobs = root.join("jobs");
         if jobs.exists() {
@@ -99,9 +104,13 @@ impl Store {
         Ok(dir)
     }
 
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.root.join("blobs")
+    }
+
     /// The content-addressed blob store. Borrowing keeps the store lock held.
     pub fn blobs(&self) -> BlobStore<'_> {
-        BlobStore::new(self.root.join("blobs"))
+        BlobStore::new(self.blobs_dir())
     }
 
     fn prepare_guest_root(&self, helper: &Path) -> Result<()> {

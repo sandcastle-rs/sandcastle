@@ -22,11 +22,20 @@ pub struct Rules<'a> {
 }
 
 pub fn restrict(spec: &VmSpec) -> Result<()> {
+    // guest-root is the VM's `/` and is written by init (mount points).
+    let mut rw_dirs = vec![spec.guest_root.as_path()];
+    // libkrun dlopens libkrunfw from here inside krun_start_enter.
+    let mut ro_dirs = vec![spec.lib_dir.as_path()];
+    for share in &spec.shares {
+        if share.read_only {
+            ro_dirs.push(share.path.as_path());
+        } else {
+            rw_dirs.push(share.path.as_path());
+        }
+    }
     let enforced = restrict_paths(&Rules {
-        // guest-root is the VM's `/` and is written by init (mount points).
-        rw_dirs: &[spec.out_dir.as_path(), spec.guest_root.as_path()],
-        // libkrun dlopens libkrunfw from here inside krun_start_enter.
-        ro_dirs: &[spec.lib_dir.as_path()],
+        rw_dirs: &rw_dirs,
+        ro_dirs: &ro_dirs,
         rw_files: &[spec.disk.as_path()],
         devices: &[Path::new("/dev/kvm")],
     })?;

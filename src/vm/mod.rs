@@ -10,12 +10,13 @@ pub mod krun;
 #[cfg(target_os = "linux")]
 pub mod landlock;
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
-use sandcastle_proto::{JOB_FILE, Job, STATUS_FILE, Status};
+use anyhow::{Context, Result, bail, ensure};
+use sandcastle_proto::{JOB_FILE, Job, SHARE_BLOBS, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status};
 use serde::{Deserialize, Serialize};
 
 use crate::install::Install;
@@ -23,69 +24,170 @@ use crate::store::Store;
 
 /// VM description the parent writes into the job dir for the `__vm` child.
 pub const SPEC_FILE: &str = "vm.json";
-const RAM_MIB: u32 = 2048;
+/// The parent's pid, so the child can tell whether it outlived it.
+pub const PARENT_PID_ENV: &str = "SANDCASTLE_PARENT_PID";
+/// Largest `status.json` read from the guest.
+const MAX_STATUS_BYTES: u64 = 1 << 20;
 
 #[cfg(target_os = "linux")]
 const LIB_PATH_ENV: &str = "LD_LIBRARY_PATH";
 #[cfg(target_os = "macos")]
 const LIB_PATH_ENV: &str = "DYLD_LIBRARY_PATH";
 
+/// A host directory shared into the guest at `/<tag>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Share {
+    pub tag: String,
+    pub path: PathBuf,
+    pub read_only: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VmSpec {
     pub lib_dir: PathBuf,
     pub guest_root: PathBuf,
     pub disk: PathBuf,
-    pub out_dir: PathBuf,
+    pub shares: Vec<Share>,
     pub vcpus: u8,
     pub ram_mib: u32,
 }
 
-/// Runs `job` in a fresh microVM and returns the guest's status.
-/// `exe` is the signed `sandcastle` binary used for the `__vm` child.
-pub fn run_job(exe: &Path, store: &Store, install: &Install, job: &Job) -> Result<Status> {
-    let job_dir = store.new_job_dir()?;
-    let out_dir = job_dir.join("out");
-    fs::write(out_dir.join(JOB_FILE), serde_json::to_vec(job)?)?;
-    let vcpus = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(usize::from(u8::MAX));
-    let spec = VmSpec {
-        lib_dir: install.lib_dir.clone(),
-        guest_root: store.guest_root(),
-        disk: store.disk(),
-        out_dir: out_dir.clone(),
-        vcpus: vcpus as u8,
-        ram_mib: RAM_MIB,
-    };
-    fs::write(job_dir.join(SPEC_FILE), serde_json::to_vec(&spec)?)?;
+/// vCPUs and memory of each build-step VM.
+#[derive(Debug, Clone, Copy)]
+pub struct Resources {
+    pub vcpus: u8,
+    pub ram_mib: u32,
+}
 
-    // libkrun dlopens libkrunfw by bare file name; point the loader at the bundle.
-    let exit = Command::new(exe)
-        .arg("__vm")
-        .arg(&job_dir)
-        .env(LIB_PATH_ENV, &install.lib_dir)
-        .status()
-        .with_context(|| format!("starting {}", exe.display()))?;
-    let status = read_status(&out_dir.join(STATUS_FILE))?;
-    if let Err(e) = fs::remove_dir_all(&job_dir) {
-        eprintln!("sandcastle: could not remove {}: {e}", job_dir.display());
+impl Default for Resources {
+    fn default() -> Self {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Self {
+            vcpus: cpus.min(usize::from(u8::MAX)) as u8,
+            ram_mib: 2048,
+        }
     }
-    outcome(exit.code(), status)
+}
+
+/// Runs guest jobs. `exe` is the signed `sandcastle` binary used for the
+/// `__vm` child.
+pub struct Vm<'a> {
+    pub exe: &'a Path,
+    pub install: &'a Install,
+    pub store: &'a Store,
+    pub resources: Resources,
+}
+
+impl Vm<'_> {
+    /// Runs `job` in a fresh microVM. `ctx` is shared read-only at `/ctx`.
+    pub fn run(&self, job: &Job, ctx: Option<&Path>) -> Result<Finished> {
+        let mut finished = Finished {
+            status: Status::default(),
+            dir: self.store.new_job_dir()?,
+        };
+        let out_dir = finished.out_dir();
+        fs::write(out_dir.join(JOB_FILE), serde_json::to_vec(job)?)?;
+        let mut shares = vec![Share {
+            tag: SHARE_OUT.into(),
+            path: out_dir.clone(),
+            read_only: false,
+        }];
+        if !matches!(job, Job::Probe { .. }) {
+            shares.push(Share {
+                tag: SHARE_BLOBS.into(),
+                path: self.store.blobs_dir(),
+                read_only: true,
+            });
+        }
+        if let Some(ctx) = ctx {
+            shares.push(Share {
+                tag: SHARE_CTX.into(),
+                path: ctx.to_path_buf(),
+                read_only: true,
+            });
+        }
+        let spec = VmSpec {
+            lib_dir: self.install.lib_dir.clone(),
+            guest_root: self.store.guest_root(),
+            disk: self.store.disk(),
+            shares,
+            vcpus: self.resources.vcpus,
+            ram_mib: self.resources.ram_mib,
+        };
+        fs::write(finished.dir.join(SPEC_FILE), serde_json::to_vec(&spec)?)?;
+
+        // libkrun dlopens libkrunfw by bare file name; point the loader at the bundle.
+        let exit = Command::new(self.exe)
+            .arg("__vm")
+            .arg(&finished.dir)
+            .env(LIB_PATH_ENV, &self.install.lib_dir)
+            .env(PARENT_PID_ENV, std::process::id().to_string())
+            .status()
+            .with_context(|| format!("starting {}", self.exe.display()))?;
+        let status = read_status(&out_dir.join(STATUS_FILE))?;
+        finished.status = outcome(exit.code(), status)?;
+        Ok(finished)
+    }
+}
+
+/// A completed job. Its directory, with the files the guest left in
+/// `out`, is removed when this is dropped.
+pub struct Finished {
+    pub status: Status,
+    dir: PathBuf,
+}
+
+impl Finished {
+    pub fn out_dir(&self) -> PathBuf {
+        self.dir.join("out")
+    }
+}
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        if let Err(e) = fs::remove_dir_all(&self.dir) {
+            eprintln!("sandcastle: could not remove {}: {e}", self.dir.display());
+        }
+    }
+}
+
+/// Opens a file the guest wrote to its `out` share. The guest controls that
+/// directory, so links and special files are refused and the open never
+/// blocks. A missing file is `None`.
+pub fn open_guest_file(path: &Path) -> Result<Option<File>> {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => {
+            return Err(std::io::Error::from(e))
+                .with_context(|| format!("opening guest file {}", path.display()));
+        }
+    };
+    let file = File::from(fd);
+    ensure!(
+        file.metadata()?.is_file(),
+        "guest file {} is not a regular file",
+        path.display()
+    );
+    Ok(Some(file))
 }
 
 fn read_status(path: &Path) -> Result<Option<Status>> {
-    match fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(status) => Ok(Some(status)),
-            Err(e) => {
-                // The guest commits status atomically, so garbage means no commit.
-                let e = anyhow::Error::new(e).context("parsing guest status");
-                eprintln!("sandcastle: ignoring unreadable guest status: {e:#}");
-                Ok(None)
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+    let Some(file) = open_guest_file(path)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_STATUS_BYTES).read_to_end(&mut bytes)?;
+    match serde_json::from_slice(&bytes) {
+        Ok(status) => Ok(Some(status)),
+        Err(e) => {
+            // The guest commits status atomically, so garbage means no commit.
+            let e = anyhow::Error::new(e).context("parsing guest status");
+            eprintln!("sandcastle: ignoring unreadable guest status: {e:#}");
+            Ok(None)
+        }
     }
 }
 
@@ -94,6 +196,12 @@ fn read_status(path: &Path) -> Result<Option<Status>> {
 /// uses 125/126/127).
 pub fn outcome(child_exit: Option<i32>, status: Option<Status>) -> Result<Status> {
     match (status, child_exit) {
+        (
+            Some(Status {
+                error: Some(error), ..
+            }),
+            _,
+        ) => bail!("guest helper failed: {error}"),
         (Some(status), _) => Ok(status),
         (None, Some(code)) => bail!(
             "VM or guest helper setup failed before the step ran (VM process exited with {code})"
@@ -143,5 +251,46 @@ mod tests {
     fn missing_status_after_signal_is_setup_failure() {
         let err = format!("{:#}", outcome(None, None).unwrap_err());
         assert!(err.contains("killed by a signal"), "{err}");
+    }
+
+    #[test]
+    fn guest_error_in_status_is_reported() {
+        let err = outcome(
+            Some(1),
+            Some(Status {
+                exit_code: 1,
+                error: Some("mounting the overlay: EINVAL".into()),
+                ..Default::default()
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("guest helper failed: mounting the overlay"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn guest_files_must_be_regular_and_not_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        fs::write(&secret, b"{}").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join("status.json")).unwrap();
+        assert!(open_guest_file(&dir.path().join("status.json")).is_err());
+        assert!(
+            open_guest_file(&dir.path().join("missing"))
+                .unwrap()
+                .is_none()
+        );
+        let fifo = dir.path().join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let err = open_guest_file(&fifo).unwrap_err();
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
     }
 }
