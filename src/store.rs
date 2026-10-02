@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::blobs::BlobStore;
 use crate::install::Install;
 
 /// Path of the guest helper inside the VM (relative to the guest root).
@@ -53,6 +54,15 @@ impl Store {
         }
         fs::create_dir_all(&jobs)?;
 
+        let blobs = root.join("blobs");
+        let blob_tmp = blobs.join("tmp");
+        if blob_tmp.exists() {
+            fs::remove_dir_all(&blob_tmp)
+                .context("removing partial blobs left by an earlier run")?;
+        }
+        fs::create_dir_all(blobs.join("sha256"))?;
+        fs::create_dir_all(&blob_tmp)?;
+
         let store = Self {
             root,
             next_job: AtomicU32::new(0),
@@ -88,6 +98,11 @@ impl Store {
         let dir = self.root.join("jobs").join(n.to_string());
         fs::create_dir_all(dir.join("out"))?;
         Ok(dir)
+    }
+
+    /// The content-addressed blob store. Borrowing keeps the store lock held.
+    pub fn blobs(&self) -> BlobStore<'_> {
+        BlobStore::new(self.root.join("blobs"))
     }
 
     fn prepare_guest_root(&self, helper: &Path) -> Result<()> {
@@ -176,12 +191,13 @@ fn write_extents(src: &mut impl Read, path: &Path, size: u64) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::os::unix::fs::MetadataExt;
+pub(crate) mod test_support {
+    use std::fs;
 
-    use super::*;
+    use super::Store;
+    use crate::install::Install;
 
-    fn template(size: u64, extents: &[(u64, &[u8])]) -> Vec<u8> {
+    pub fn template(size: u64, extents: &[(u64, &[u8])]) -> Vec<u8> {
         let mut raw = b"SCX1".to_vec();
         raw.extend_from_slice(&size.to_le_bytes());
         for (off, data) in extents {
@@ -192,7 +208,7 @@ mod tests {
         zstd::encode_all(&raw[..], 3).unwrap()
     }
 
-    fn fixture() -> (tempfile::TempDir, Install) {
+    pub fn fixture() -> (tempfile::TempDir, Install) {
         let dir = tempfile::tempdir().unwrap();
         let lib_dir = dir.path().join("lib");
         fs::create_dir(&lib_dir).unwrap();
@@ -205,6 +221,21 @@ mod tests {
         fs::write(&guest_bin, b"helper v1").unwrap();
         (dir, Install { lib_dir, guest_bin })
     }
+
+    /// An opened store backed by a tiny fake disk template and helper.
+    pub fn store() -> (tempfile::TempDir, Store) {
+        let (dir, install) = fixture();
+        let store = Store::open(&dir.path().join("store"), &install).unwrap();
+        (dir, store)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::MetadataExt;
+
+    use super::test_support::{fixture, template};
+    use super::*;
 
     #[test]
     fn expand_sparse_writes_extents_and_leaves_holes() {
@@ -315,5 +346,20 @@ mod tests {
             .guest_root()
             .join(GUEST_HELPER_PATH.trim_start_matches('/'));
         assert_eq!(fs::read(copied).unwrap(), b"helper v2");
+    }
+
+    #[test]
+    fn open_removes_partial_blobs() {
+        let (dir, install) = fixture();
+        let root = dir.path().join("store");
+        let leftover = {
+            let store = Store::open(&root, &install).unwrap();
+            let temp = store.blobs().temp().unwrap();
+            // Simulate a crash: the temp file is never committed or cleaned up.
+            temp.into_temp_path().keep().unwrap()
+        };
+        assert!(leftover.exists());
+        let _store = Store::open(&root, &install).unwrap();
+        assert!(!leftover.exists());
     }
 }
