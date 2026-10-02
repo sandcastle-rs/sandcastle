@@ -30,7 +30,7 @@ fn run() -> Result<i32> {
     let status = match job {
         Job::Probe { exit_code } => Status {
             exit_code,
-            probe: None,
+            probe: Some(crate::probe::run()?),
         },
     };
     let mut file = File::create(out.join(STATUS_FILE)).context("creating status file")?;

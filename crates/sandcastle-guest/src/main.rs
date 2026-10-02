@@ -4,6 +4,9 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
+mod probe;
+
+#[cfg(target_os = "linux")]
 fn main() {
     linux::main()
 }
