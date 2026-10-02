@@ -143,15 +143,24 @@ fn class_char(p: &[char]) -> Result<(char, &[char])> {
     }
 }
 
-/// Source paths in the context for one COPY argument, sorted.
-fn expand_source(ctx: &Path, source: &str) -> Result<Vec<PathBuf>> {
+/// A resolved source path and the name it is copied under, which is the
+/// last component before symlinks were followed.
+type Source = (PathBuf, Option<OsString>);
+
+/// The last real component of `path`, if any.
+fn last_name(path: &Path) -> Option<OsString> {
+    parts(path).pop().filter(|n| n != "..")
+}
+
+/// Sources in the context for one COPY argument, sorted.
+fn expand_source(ctx: &Path, source: &str) -> Result<Vec<Source>> {
     if !has_meta(source) {
         let path = resolve_in_root(ctx, Path::new(source))?;
         ensure!(
             fs::symlink_metadata(&path).is_ok(),
             "{source}: not found in the build context"
         );
-        return Ok(vec![path]);
+        return Ok(vec![(path, last_name(Path::new(source)))]);
     }
     let mut current = vec![PathBuf::new()];
     for part in parts(Path::new(source)) {
@@ -187,7 +196,7 @@ fn expand_source(ctx: &Path, source: &str) -> Result<Vec<PathBuf>> {
     for rel in current {
         let path = resolve_in_root(ctx, &rel)?;
         if fs::symlink_metadata(&path).is_ok() {
-            out.push(path);
+            out.push((path, last_name(&rel)));
         }
     }
     ensure!(
@@ -214,14 +223,15 @@ impl Copy<'_> {
         }
         let into_dir = dest.ends_with('/') || dest == "." || dest.ends_with("/.") || srcs.len() > 1;
         let target = resolve_in_root(self.root, &Path::new(self.workdir).join(dest))?;
-        for src in &srcs {
+        for (src, name) in &srcs {
             if fs::metadata(src)?.is_dir() {
                 self.mkdir_p(&target)?;
                 self.copy_children(src, &target)?;
             } else {
                 let file_dest = if into_dir || target.is_dir() {
                     self.mkdir_p(&target)?;
-                    target.join(src.file_name().context("source has no file name")?)
+                    let name = name.as_deref().or(src.file_name());
+                    target.join(name.context("source has no file name")?)
                 } else {
                     self.mkdir_p(target.parent().context("destination has no parent")?)?;
                     target.clone()
@@ -544,6 +554,25 @@ mod tests {
         assert_eq!(
             fs::metadata(f.root.join("keep")).unwrap().mode() & 0o7777,
             0o700
+        );
+    }
+
+    #[test]
+    fn followed_symlink_sources_keep_the_link_name() {
+        let f = fixture();
+        symlink("/hello.txt", f.ctx.join("abs-link")).unwrap();
+        copy(&f, "/").run(&["abs-link".into()], "/app/").unwrap();
+        assert_eq!(
+            fs::read_to_string(f.root.join("app/abs-link")).unwrap(),
+            "hi"
+        );
+        assert!(!f.root.join("app/hello.txt").exists());
+
+        symlink("hello.txt", f.ctx.join("three.conf")).unwrap();
+        copy(&f, "/").run(&["thr*.conf".into()], "/etc/").unwrap();
+        assert_eq!(
+            fs::read_to_string(f.root.join("etc/three.conf")).unwrap(),
+            "hi"
         );
     }
 }
