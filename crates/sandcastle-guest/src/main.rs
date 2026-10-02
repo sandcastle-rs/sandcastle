@@ -3,6 +3,9 @@
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod layer;
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod user;
+
 #[cfg(target_os = "linux")]
 mod linux;
 
