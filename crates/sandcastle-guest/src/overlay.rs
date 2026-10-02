@@ -52,7 +52,12 @@ impl Overlay {
             fsconfig_set_string(&fs, key, value)?;
         }
         fsconfig_create(&fs).context("creating the overlay")?;
-        let mnt = fsmount(&fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())?;
+        // NODEV: device nodes from image layers must never be openable.
+        let mnt = fsmount(
+            &fs,
+            FsMountFlags::FSMOUNT_CLOEXEC,
+            MountAttrFlags::MOUNT_ATTR_NODEV,
+        )?;
         move_mount(
             &mnt,
             "",

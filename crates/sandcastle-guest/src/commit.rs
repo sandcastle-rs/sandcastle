@@ -29,7 +29,7 @@ pub fn commit(upper: &Path, out: &Path) -> Result<Option<String>> {
         WRITE_BUFFER,
         file,
     )));
-    walk(&mut tar, upper, Path::new(""), &mut HashMap::new())?;
+    walk(&mut tar, upper, Path::new(""), &mut Scratch::new())?;
     let (buffered, diff_id) = tar.into_inner()?.finish();
     let file = buffered
         .into_inner()
@@ -38,11 +38,29 @@ pub fn commit(upper: &Path, out: &Path) -> Result<Option<String>> {
     Ok(Some(diff_id))
 }
 
+/// State shared across the walk: hardlink targets and xattr buffers, so
+/// per-entry work is just the syscalls.
+struct Scratch {
+    links: HashMap<(u64, u64), PathBuf>,
+    names: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self {
+            links: HashMap::new(),
+            names: vec![0; XATTR_MAX],
+            value: vec![0; XATTR_MAX],
+        }
+    }
+}
+
 fn walk<W: Write>(
     tar: &mut tar::Builder<W>,
     root: &Path,
     rel: &Path,
-    links: &mut HashMap<(u64, u64), PathBuf>,
+    scratch: &mut Scratch,
 ) -> Result<()> {
     let mut names: Vec<OsString> = fs::read_dir(root.join(rel))?
         .map(|e| e.map(|e| e.file_name()))
@@ -53,7 +71,7 @@ fn walk<W: Write>(
         let path = root.join(&rel);
         let meta = fs::symlink_metadata(&path)?;
         let ft = meta.file_type();
-        let (opaque, xattrs) = read_xattrs(&path)?;
+        let (opaque, xattrs) = read_xattrs(&path, &mut scratch.names, &mut scratch.value)?;
         let mut m = Meta {
             mode: meta.mode(),
             uid: meta.uid().into(),
@@ -69,11 +87,11 @@ fn walk<W: Write>(
         } else if ft.is_file() {
             if meta.nlink() > 1 {
                 let key = (meta.dev(), meta.ino());
-                if let Some(first) = links.get(&key) {
+                if let Some(first) = scratch.links.get(&key) {
                     layer::append(tar, &rel, &Kind::Hardlink(first.clone()), &m, io::empty())?;
                     continue;
                 }
-                links.insert(key, rel.clone());
+                scratch.links.insert(key, rel.clone());
             }
             m.size = meta.len();
             layer::append(tar, &rel, &Kind::File, &m, File::open(&path)?)?;
@@ -92,7 +110,7 @@ fn walk<W: Write>(
         };
         layer::append(tar, &rel, &kind, &m, io::empty())?;
         if ft.is_dir() {
-            walk(tar, root, &rel, links)?;
+            walk(tar, root, &rel, scratch)?;
         }
     }
     Ok(())
@@ -100,19 +118,17 @@ fn walk<W: Write>(
 
 /// Returns whether the overlay marked the directory opaque, and the xattrs
 /// that belong in the image.
-fn read_xattrs(path: &Path) -> Result<(bool, Xattrs)> {
-    let mut names = vec![0u8; XATTR_MAX];
-    let len = match llistxattr(path, &mut names[..]) {
+fn read_xattrs(path: &Path, names: &mut [u8], value: &mut [u8]) -> Result<(bool, Xattrs)> {
+    let len = match llistxattr(path, &mut *names) {
         Ok(len) => len,
         Err(rustix::io::Errno::NOTSUP) => return Ok((false, Vec::new())),
         Err(e) => return Err(e).with_context(|| format!("listing xattrs of {}", path.display())),
     };
     let mut opaque = false;
     let mut out = Vec::new();
-    let mut value = vec![0u8; XATTR_MAX];
     for name in names[..len].split(|&b| b == 0).filter(|n| !n.is_empty()) {
         let name = String::from_utf8_lossy(name).into_owned();
-        let n = lgetxattr(path, name.as_str(), &mut value[..])?;
+        let n = lgetxattr(path, name.as_str(), &mut *value)?;
         if name == OPAQUE_XATTR {
             opaque = &value[..n] == b"y";
         } else if !name.starts_with(OVERLAY_XATTR_PREFIX) {

@@ -117,6 +117,8 @@ pub fn commit_upper(store: &Store, upper: &Path, out: &Path) -> Result<Status> {
             if dest.exists() {
                 fs::remove_dir_all(upper)?;
             } else {
+                // A layer directory must be complete on disk once it exists.
+                store.sync()?;
                 fs::rename(upper, &dest)?;
             }
         }

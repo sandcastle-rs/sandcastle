@@ -3,11 +3,12 @@
 //! scratch wiped at every boot.
 
 use std::ffi::CStr;
-use std::fs;
+use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rustix::fs::syncfs;
 use rustix::mount::{MountFlags, UnmountFlags, mount, unmount};
 use sandcastle_proto::{LowerLayer, SHARE_BLOBS};
 
@@ -48,6 +49,12 @@ impl Store {
         unmount(STORE, UnmountFlags::empty()).context("unmounting the store disk")
     }
 
+    /// Flushes everything written to the store disk so far.
+    pub fn sync(&self) -> Result<()> {
+        let root = File::open(STORE).context("opening the store")?;
+        syncfs(root).context("syncing the store disk")
+    }
+
     pub fn layer_dir(&self, diff_id: &str) -> Result<PathBuf> {
         Ok(self.layers.join(layer::digest_hex(diff_id)?))
     }
@@ -86,6 +93,9 @@ impl Store {
                 .join(format!("unpack-{}", layer::digest_hex(&l.diff_id)?));
             unpack::unpack(&blob, &l.media_type, &l.diff_id, &tmp)
                 .with_context(|| format!("unpacking layer {}", l.diff_id))?;
+            // The directory's presence marks the layer complete, so its
+            // contents must be on disk before it appears.
+            self.sync()?;
             fs::rename(&tmp, &dest)?;
         }
         Ok(())
