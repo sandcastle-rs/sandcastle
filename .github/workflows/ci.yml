@@ -35,3 +35,32 @@ jobs:
         with:
           name: sandcastle-libs-${{ matrix.platform }}
           path: lib
+
+  test:
+    strategy:
+      matrix:
+        runner: [macos-14, ubuntu-22.04]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  vm-linux:
+    needs: libs
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sandcastle-libs-linux-x86_64
+          path: lib
+      - name: Allow the runner user to use /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: taiki-e/install-action@just
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: just it

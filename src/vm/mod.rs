@@ -7,6 +7,8 @@
 
 pub mod child;
 pub mod krun;
+#[cfg(target_os = "linux")]
+pub mod landlock;
 
 use std::fs;
 use std::path::{Path, PathBuf};

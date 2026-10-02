@@ -29,5 +29,7 @@ fn try_enter(job_dir: &Path) -> Result<Infallible> {
     ctx.add_virtiofs("out", &spec.out_dir)?;
     ctx.set_workdir("/")?;
     ctx.set_exec(GUEST_HELPER_PATH, &[], &["HOME=/"])?;
+    #[cfg(target_os = "linux")]
+    super::landlock::restrict(&spec)?;
     Err(ctx.start_enter())
 }
