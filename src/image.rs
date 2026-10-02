@@ -189,7 +189,11 @@ impl<W> Hashing<W> {
     }
 
     fn into_parts(self) -> (W, Digest, u64) {
-        (self.inner, digest_from(&self.hasher.finalize()), self.len)
+        (
+            self.inner,
+            digest_from(&self.hasher.finalize().into()),
+            self.len,
+        )
     }
 }
 
@@ -281,13 +285,19 @@ pub fn write_layout(
     fs::create_dir_all(&out_blobs).with_context(|| format!("creating {}", out_blobs.display()))?;
     for desc in state.layers.iter().chain([&config, &manifest_desc]) {
         let dest = out_blobs.join(desc.digest().digest());
-        if !dest.exists() {
-            let src = blobs.path(desc.digest())?;
-            // fs::copy clones on APFS and uses copy_file_range on Linux.
-            let partial = dest.with_extension("partial");
-            fs::copy(&src, &partial)
+        let present =
+            fs::symlink_metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == desc.size());
+        if !present {
+            // A unique temp file renamed over `dest` replaces a planted
+            // symlink instead of writing through it.
+            let mut temp = NamedTempFile::new_in(&out_blobs)
+                .with_context(|| format!("creating a temporary file in {}", out_blobs.display()))?;
+            let mut src = File::open(blobs.path(desc.digest())?)?;
+            io::copy(&mut src, &mut temp)
                 .with_context(|| format!("copying blob {} into the layout", desc.digest()))?;
-            fs::rename(&partial, &dest)?;
+            temp.persist(&dest)
+                .map_err(|e| e.error)
+                .with_context(|| format!("storing blob {} in the layout", desc.digest()))?;
         }
     }
 
@@ -306,9 +316,16 @@ pub fn write_layout(
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", path.display()))?;
-    fs::rename(&tmp, path)?;
+    let dir = path
+        .parent()
+        .context("layout file has no parent directory")?;
+    let mut temp = NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
+    temp.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    temp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -504,6 +521,57 @@ mod tests {
         );
         assert_eq!(manifest.layers().len(), 1);
         read_verified(&out, &manifest.layers()[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_layout_does_not_follow_planted_symlinks() {
+        use std::os::unix::fs::symlink;
+        let (dir, store) = test_support::store();
+        let blobs = store.blobs();
+        let state = built_state(&blobs, "app");
+        let out = dir.path().join("out");
+        fs::create_dir_all(out.join("blobs/sha256")).unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        let layer_hex = state.layers[0].digest().digest().to_string();
+        symlink(&victim, out.join("blobs/sha256").join(&layer_hex)).unwrap();
+        symlink(
+            &victim,
+            out.join("blobs/sha256")
+                .join(format!("{layer_hex}.partial")),
+        )
+        .unwrap();
+        for name in [
+            "index.json.tmp",
+            "oci-layout.tmp",
+            "index.tmp",
+            "oci-layout",
+        ] {
+            symlink(&victim, out.join(name)).unwrap();
+        }
+
+        let manifest = write_layout(&blobs, &state, &out, "demo").unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        let index = ImageIndex::from_file(out.join("index.json")).unwrap();
+        assert_eq!(index.manifests()[0].digest(), manifest.digest());
+        let layer_path = out.join("blobs/sha256").join(&layer_hex);
+        assert!(fs::symlink_metadata(&layer_path).unwrap().is_file());
+        read_verified(&out, &state.layers[0]);
+    }
+
+    #[test]
+    fn write_layout_replaces_wrong_size_blob() {
+        let (dir, store) = test_support::store();
+        let blobs = store.blobs();
+        let state = built_state(&blobs, "app");
+        let out = dir.path().join("out");
+        fs::create_dir_all(out.join("blobs/sha256")).unwrap();
+        let layer_hex = state.layers[0].digest().digest().to_string();
+        fs::write(out.join("blobs/sha256").join(&layer_hex), "truncat").unwrap();
+        write_layout(&blobs, &state, &out, "demo").unwrap();
+        read_verified(&out, &state.layers[0]);
     }
 
     #[test]

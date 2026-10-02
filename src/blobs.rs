@@ -70,11 +70,11 @@ impl BlobStore<'_> {
 }
 
 pub fn sha256(bytes: &[u8]) -> Digest {
-    digest_from(&Sha256::digest(bytes))
+    digest_from(&Sha256::digest(bytes).into())
 }
 
 /// Turns a finished SHA-256 hash into an OCI digest.
-pub fn digest_from(hash: &[u8]) -> Digest {
+pub fn digest_from(hash: &[u8; 32]) -> Digest {
     let mut s = String::with_capacity(7 + 2 * hash.len());
     s.push_str("sha256:");
     for b in hash {

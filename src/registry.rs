@@ -2,20 +2,30 @@
 //! async code in sandcastle; it runs on a private current-thread Tokio runtime.
 
 use std::collections::HashSet;
+use std::io;
+use std::pin::Pin;
 use std::str::FromStr;
+use std::task::{Context, Poll};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::StreamExt;
 use oci_client::client::ClientConfig;
 use oci_client::manifest::{ImageIndexEntry, OciDescriptor};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use oci_spec::image::{Arch, Descriptor, Digest, ImageConfiguration, MediaType, Os};
+use tokio::io::AsyncWrite;
 
 use crate::blobs::BlobStore;
 
 /// Layer downloads in flight at once.
 const PARALLEL_DOWNLOADS: usize = 4;
+
+/// Largest image config accepted from a registry.
+const MAX_CONFIG_BYTES: u64 = 16 << 20;
+
+/// Largest layer accepted from a registry: the store disk size.
+const MAX_LAYER_BYTES: u64 = 64 << 30;
 
 /// A base image whose layer blobs are all present in the blob store.
 #[derive(Debug)]
@@ -38,12 +48,22 @@ pub fn pull(blobs: &BlobStore<'_>, reference: &str) -> Result<PulledImage> {
         .with_context(|| format!("pulling {reference}"))
 }
 
-/// The tag to name an exported image after: the reference's tag, or `latest`.
+/// The tag to name an exported image after: the reference's tag, else the
+/// short digest (`sha256-<12 hex>`) of a digest reference, else `latest`.
 pub fn default_tag(reference: &str) -> Result<String> {
     let parsed: Reference = reference
         .parse()
         .with_context(|| format!("invalid image reference {reference:?}"))?;
-    Ok(parsed.tag().unwrap_or("latest").to_string())
+    if let Some(tag) = parsed.tag() {
+        return Ok(tag.to_string());
+    }
+    Ok(match parsed.digest() {
+        Some(digest) => {
+            let (algorithm, hex) = digest.split_once(':').unwrap_or(("sha256", digest));
+            format!("{algorithm}-{}", &hex[..hex.len().min(12)])
+        }
+        None => "latest".to_string(),
+    })
 }
 
 async fn pull_async(blobs: &BlobStore<'_>, reference: &Reference) -> Result<PulledImage> {
@@ -56,11 +76,28 @@ async fn pull_async(blobs: &BlobStore<'_>, reference: &Reference) -> Result<Pull
         })),
         ..Default::default()
     });
-    let (manifest, _, config_json) = client
-        .pull_manifest_and_config(reference, &RegistryAuth::Anonymous)
+    // oci-client buffers the manifest body itself, so its size is not bounded here.
+    let (manifest, _) = client
+        .pull_image_manifest(reference, &RegistryAuth::Anonymous)
         .await
-        .with_context(|| format!("fetching the linux/{arch} manifest and config"))?;
-    let config = ImageConfiguration::from_reader(config_json.as_bytes())
+        .with_context(|| format!("fetching the linux/{arch} manifest"))?;
+    let config_size = u64::try_from(manifest.config.size).context("negative config size")?;
+    check_size_limit(
+        "config",
+        &manifest.config.digest,
+        config_size,
+        MAX_CONFIG_BYTES,
+    )?;
+    let mut config_bytes = CappedBuffer::new(config_size);
+    client
+        .pull_blob(
+            reference,
+            &without_urls(&manifest.config),
+            &mut config_bytes,
+        )
+        .await
+        .context("downloading the image config")?;
+    let config = ImageConfiguration::from_reader(&config_bytes.into_inner()[..])
         .context("parsing the image config")?;
     check_platform(&config, &arch)?;
     let layers = manifest
@@ -68,6 +105,14 @@ async fn pull_async(blobs: &BlobStore<'_>, reference: &Reference) -> Result<Pull
         .iter()
         .map(to_descriptor)
         .collect::<Result<Vec<_>>>()?;
+    for layer in &layers {
+        check_size_limit(
+            "layer",
+            layer.digest().as_ref(),
+            layer.size(),
+            MAX_LAYER_BYTES,
+        )?;
+    }
 
     let mut seen = HashSet::new();
     let mut missing = Vec::new();
@@ -97,13 +142,87 @@ async fn fetch_layer(
     let temp = blobs.temp()?;
     let file = tokio::fs::File::from_std(temp.as_file().try_clone()?);
     // pull_blob verifies the digest while streaming and fails on a mismatch.
+    // Descriptor `urls` are dropped so blobs only come from the registry.
     client
-        .pull_blob(reference, remote, file)
+        .pull_blob(reference, &without_urls(remote), file)
         .await
         .with_context(|| format!("downloading layer {}", local.digest()))?;
+    let actual = temp.as_file().metadata()?.len();
+    check_downloaded_size(local.digest().as_ref(), local.size(), actual)?;
     blobs.commit(temp, local.digest())?;
     eprintln!("{}: downloaded ({} bytes)", local.digest(), local.size());
     Ok(())
+}
+
+/// Rejects a descriptor larger than `limit` before anything is downloaded.
+fn check_size_limit(what: &str, digest: &str, size: u64, limit: u64) -> Result<()> {
+    ensure!(
+        size <= limit,
+        "{what} {digest} is {size} bytes, over the {limit} byte limit"
+    );
+    Ok(())
+}
+
+/// Rejects a blob whose downloaded length differs from its descriptor.
+fn check_downloaded_size(digest: &str, expected: u64, actual: u64) -> Result<()> {
+    ensure!(
+        expected == actual,
+        "blob {digest} is {actual} bytes, but its descriptor says {expected}"
+    );
+    Ok(())
+}
+
+/// A copy of `remote` that cannot redirect the download to other hosts.
+fn without_urls(remote: &OciDescriptor) -> OciDescriptor {
+    OciDescriptor {
+        urls: None,
+        ..remote.clone()
+    }
+}
+
+/// In-memory sink that fails once more than `limit` bytes are written.
+struct CappedBuffer {
+    bytes: Vec<u8>,
+    limit: u64,
+}
+
+impl CappedBuffer {
+    fn new(limit: u64) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl AsyncWrite for CappedBuffer {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let total = self.bytes.len() as u64 + buf.len() as u64;
+        if total > self.limit {
+            return Poll::Ready(Err(io::Error::other(format!(
+                "blob exceeds its declared size of {} bytes",
+                self.limit
+            ))));
+        }
+        self.bytes.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// Rejects a config for another platform; a reference that resolves straight
@@ -253,11 +372,77 @@ mod tests {
     }
 
     #[test]
-    fn default_tag_falls_back_to_latest() {
+    fn default_tag_uses_tag_or_short_digest() {
         assert_eq!(
             default_tag("mirror.gcr.io/library/busybox:1.36").unwrap(),
             "1.36"
         );
         assert_eq!(default_tag("alpine").unwrap(), "latest");
+        let digest = format!("sha256:{}", "ab12".repeat(16));
+        assert_eq!(
+            default_tag(&format!("alpine@{digest}")).unwrap(),
+            "sha256-ab12ab12ab12"
+        );
+    }
+
+    #[test]
+    fn oversized_descriptors_are_rejected() {
+        let digest = format!("sha256:{}", "1".repeat(64));
+        check_size_limit("config", &digest, MAX_CONFIG_BYTES, MAX_CONFIG_BYTES).unwrap();
+        let err = check_size_limit("config", &digest, MAX_CONFIG_BYTES + 1, MAX_CONFIG_BYTES)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&digest), "{msg}");
+        assert!(msg.contains(&(MAX_CONFIG_BYTES + 1).to_string()), "{msg}");
+        assert!(msg.contains(&MAX_CONFIG_BYTES.to_string()), "{msg}");
+        check_size_limit("layer", &digest, MAX_LAYER_BYTES, MAX_LAYER_BYTES).unwrap();
+        assert!(check_size_limit("layer", &digest, MAX_LAYER_BYTES + 1, MAX_LAYER_BYTES).is_err());
+    }
+
+    #[test]
+    fn downloaded_size_must_match_descriptor() {
+        let digest = format!("sha256:{}", "2".repeat(64));
+        check_downloaded_size(&digest, 10, 10).unwrap();
+        let err = check_downloaded_size(&digest, 10, 11).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&digest) && msg.contains("10") && msg.contains("11"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn blob_urls_are_stripped_from_descriptors() {
+        let mut remote = OciDescriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            digest: format!("sha256:{}", "3".repeat(64)),
+            size: 7,
+            urls: Some(vec!["http://169.254.169.254/".into()]),
+            annotations: Some([("k".to_string(), "v".to_string())].into()),
+            ..Default::default()
+        };
+        let stripped = without_urls(&remote);
+        assert_eq!(stripped.urls, None);
+        remote.urls = None;
+        assert_eq!(
+            serde_json::to_value(&stripped).unwrap(),
+            serde_json::to_value(&remote).unwrap()
+        );
+    }
+
+    #[test]
+    fn capped_writer_rejects_more_than_the_limit() {
+        use tokio::io::AsyncWriteExt;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut ok = CappedBuffer::new(4);
+            ok.write_all(b"ab").await.unwrap();
+            ok.write_all(b"cd").await.unwrap();
+            assert_eq!(ok.into_inner(), b"abcd");
+            let mut over = CappedBuffer::new(3);
+            assert!(over.write_all(b"abcd").await.is_err());
+        });
     }
 }

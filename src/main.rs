@@ -27,6 +27,8 @@ enum Command {
         json: bool,
     },
     /// Pull an image and write it as an OCI image layout directory.
+    ///
+    /// HEALTHCHECK and other non-OCI Docker config fields are not preserved.
     Pull {
         /// Image reference, e.g. `mirror.gcr.io/library/busybox:1.36`.
         reference: String,
