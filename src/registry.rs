@@ -62,6 +62,7 @@ async fn pull_async(blobs: &BlobStore<'_>, reference: &Reference) -> Result<Pull
         .with_context(|| format!("fetching the linux/{arch} manifest and config"))?;
     let config = ImageConfiguration::from_reader(config_json.as_bytes())
         .context("parsing the image config")?;
+    check_platform(&config, &arch)?;
     let layers = manifest
         .layers
         .iter()
@@ -102,6 +103,19 @@ async fn fetch_layer(
         .with_context(|| format!("downloading layer {}", local.digest()))?;
     blobs.commit(temp, local.digest())?;
     eprintln!("{}: downloaded ({} bytes)", local.digest(), local.size());
+    Ok(())
+}
+
+/// Rejects a config for another platform; a reference that resolves straight
+/// to a single manifest never goes through `select_platform`.
+pub(crate) fn check_platform(config: &ImageConfiguration, arch: &Arch) -> Result<()> {
+    if config.os() != &Os::Linux || config.architecture() != arch {
+        bail!(
+            "image is {}/{}, but linux/{arch} is required",
+            config.os(),
+            config.architecture()
+        );
+    }
     Ok(())
 }
 
@@ -220,6 +234,22 @@ mod tests {
             format!("{err:#}").contains("application/x-unknown"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn single_manifest_for_other_platform_is_rejected() {
+        let config = |os: &str, arch: &str| {
+            ImageConfiguration::from_reader(
+                format!(r#"{{"os": "{os}", "architecture": "{arch}", "rootfs": {{"type": "layers", "diff_ids": []}}}}"#)
+                    .as_bytes(),
+            )
+            .unwrap()
+        };
+        check_platform(&config("linux", "arm64"), &Arch::ARM64).unwrap();
+        let err = check_platform(&config("linux", "amd64"), &Arch::ARM64).unwrap_err();
+        assert!(format!("{err:#}").contains("linux/amd64"), "{err:#}");
+        let err = check_platform(&config("windows", "arm64"), &Arch::ARM64).unwrap_err();
+        assert!(format!("{err:#}").contains("windows/arm64"), "{err:#}");
     }
 
     #[test]
