@@ -64,7 +64,9 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - uses: taiki-e/install-action@just
       - run: rustup target add x86_64-unknown-linux-musl
-      - run: just it
+      - name: Install podman and skopeo
+        run: sudo apt-get update && sudo apt-get install -y podman skopeo
+      - run: just it-podman
 
   registry:
     needs: libs

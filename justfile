@@ -24,7 +24,7 @@ it: build
     mkdir -p target/it
     cp target/release/sandcastle target/release/sandcastle-guest target/it/
     {{ if os() == "macos" { "codesign --force --sign - --entitlements sandcastle.entitlements " + it_bin } else { "true" } }}
-    SANDCASTLE_LIBKRUN_DIR={{lib_dir}} SANDCASTLE_BIN={{it_bin}} cargo test --release -p sandcastle --test vm --test cli -- --ignored --test-threads=1
+    SANDCASTLE_LIBKRUN_DIR={{lib_dir}} SANDCASTLE_BIN={{it_bin}} cargo test --release -p sandcastle --test vm --test cli --test build -- --ignored --test-threads=1
 
 # Registry tests: need network, lib/ (store template) and skopeo.
 it-registry:
@@ -40,3 +40,7 @@ fetch-libs:
     rm -rf {{lib_dir}}
     gh run download --name sandcastle-libs-{{platform}} --dir {{lib_dir}}
     cd {{lib_dir}} && shasum -a 256 -c SHA256SUMS
+
+# Run a built image with podman (Linux CI): needs podman and skopeo.
+it-podman: it
+    SANDCASTLE_LIBKRUN_DIR={{lib_dir}} SANDCASTLE_BIN={{it_bin}} cargo test --release -p sandcastle --test podman -- --ignored --test-threads=1
