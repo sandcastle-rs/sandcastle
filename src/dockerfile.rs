@@ -150,7 +150,7 @@ mod tests {
         );
         assert_eq!(
             err("# only a comment\n"),
-            "the Dockerfile has no instructions"
+            "line 1: file with no instructions"
         );
     }
 
