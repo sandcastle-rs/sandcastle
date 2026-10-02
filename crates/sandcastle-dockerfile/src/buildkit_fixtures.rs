@@ -1,11 +1,12 @@
 //! BuildKit's own parser and shell-lexer fixtures, vendored under
 //! `testdata/buildkit/` (see `testdata/buildkit/SOURCE`), as table tests.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::dump::dump;
-use crate::parse;
+use crate::{expand, expand_words, parse};
 
 fn testdata(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -69,4 +70,72 @@ fn parser_line_numbers_match_buildkit() {
         .map(|n| (n.start_line, n.end_line))
         .collect();
     assert_eq!(ranges, [(5, 5), (11, 12), (17, 31)]);
+}
+
+/// `envVarTest`: `platform | input | expected` with platform A (all), U
+/// (unix) or W (windows, skipped); expected `error` means expansion fails.
+#[test]
+fn shell_env_var_test_matches_buildkit() {
+    let env: HashMap<String, String> = [
+        ("PWD", "/home"),
+        ("SHELL", "bash"),
+        ("KOREAN", "한국어"),
+        ("NULL", ""),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    let data = fs::read_to_string(testdata("shell/envVarTest")).expect("envVarTest");
+    let mut checked = 0;
+    for (n, line) in data.lines().enumerate() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.trim().split('|').collect();
+        assert_eq!(fields.len(), 3, "line {}", n + 1);
+        let (platform, input, expected) = (fields[0].trim(), fields[1].trim(), fields[2].trim());
+        if platform == "W" {
+            continue;
+        }
+        let got = expand(input, &env, '\\');
+        if expected == "error" {
+            assert!(
+                got.is_err(),
+                "line {}: {input:?} gave {got:?}, want error",
+                n + 1
+            );
+        } else {
+            assert_eq!(got.as_deref(), Ok(expected), "line {}: {input:?}", n + 1);
+        }
+        checked += 1;
+    }
+    assert!(checked > 200, "only {checked} cases ran");
+}
+
+/// `wordsTest`: `ENV k=v` lines extend the environment; `input | w1,w2`
+/// lines expect those words (or `error`).
+#[test]
+fn shell_words_test_matches_buildkit() {
+    let data = fs::read_to_string(testdata("shell/wordsTest")).expect("wordsTest");
+    let mut env = HashMap::new();
+    for (n, line) in data.lines().enumerate() {
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(assignment) = line.strip_prefix("ENV ") {
+            let (k, v) = assignment
+                .trim_start_matches(' ')
+                .split_once('=')
+                .expect("k=v");
+            env.insert(k.to_owned(), v.to_owned());
+            continue;
+        }
+        let (input, expected) = line
+            .split_once('|')
+            .unwrap_or_else(|| panic!("line {}: no |", n + 1));
+        let expected: Vec<&str> = expected.trim_start_matches(' ').split(',').collect();
+        let got =
+            expand_words(input.trim(), &env, '\\').unwrap_or_else(|_| vec!["error".to_owned()]);
+        assert_eq!(got, expected, "line {}: {input:?}", n + 1);
+    }
 }

@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod expand;
 mod instruction;
 mod line_parsers;
 mod parser;
@@ -16,6 +17,7 @@ mod buildkit_fixtures;
 #[cfg(test)]
 mod dump;
 
+pub use expand::{Env, ExpandError, expand, expand_words};
 pub use instruction::{
     Command, Flag, Instruction, InstructionError, InstructionErrorKind, KeyValue,
 };
