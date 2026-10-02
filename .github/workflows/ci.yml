@@ -1,0 +1,31 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  libs:
+    strategy:
+      matrix:
+        include:
+          - { runner: macos-14, platform: macos-aarch64 }
+          - { runner: ubuntu-22.04, platform: linux-x86_64 }
+          - { runner: ubuntu-22.04-arm, platform: linux-aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: lib
+          key: libs-${{ matrix.platform }}-${{ hashFiles('scripts/build-libs.sh', 'scripts/libs.env', 'scripts/pack-sparse.py') }}
+      - if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
+        run: brew install lld xz e2fsprogs zstd
+      - if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y patchelf libc6-dev e2fsprogs zstd binutils
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: scripts/build-libs.sh lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandcastle-libs-${{ matrix.platform }}
+          path: lib
