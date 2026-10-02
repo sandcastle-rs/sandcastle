@@ -1,4 +1,4 @@
-//! `RUN`: the command runs chrooted in the overlay, in its own PID and mount
+//! `RUN`: the command runs in the overlay as its root, in its own PID and mount
 //! namespaces, as Docker's runtime would run it.
 
 use std::ffi::{CStr, OsString};
@@ -11,8 +11,11 @@ use std::process::{self, Command, ExitStatus, Stdio};
 use anyhow::{Context, Result};
 use rustix::fs::{CWD, FileType, Mode, makedev, mknodat};
 use rustix::io::Errno;
-use rustix::mount::{MountFlags, MountPropagationFlags, mount, mount_bind, mount_change};
-use rustix::process::{Gid, Uid, chroot};
+use rustix::mount::{
+    MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_bind, mount_change,
+    mount_remount, unmount,
+};
+use rustix::process::{Gid, Uid, pivot_root};
 use rustix::thread::{
     CapabilitySet, CapabilitySets, UnshareFlags, remove_capability_from_bounding_set,
     set_capabilities, set_thread_groups, set_thread_res_gid, set_thread_res_uid,
@@ -224,8 +227,8 @@ fn setup(spec: &ExecSpec) -> Result<()> {
                 .with_context(|| format!("binding /etc/{file}"))?;
         }
     }
-    chroot(root)?;
-    std::env::set_current_dir("/")?;
+    mask_proc(root).context("masking /proc")?;
+    enter_root(root)?;
     rustix::process::umask(Mode::from_raw_mode(0o022));
     fs::create_dir_all(&spec.workdir)
         .with_context(|| format!("creating workdir {}", spec.workdir))?;
@@ -240,9 +243,48 @@ fn setup(spec: &ExecSpec) -> Result<()> {
     Ok(())
 }
 
+/// Makes `root` the process's root and detaches the VM's old root, which still
+/// has the store mounted. Unlike `chroot`, this cannot be escaped with a
+/// nested chroot: the old root is no longer in the mount namespace.
+fn enter_root(root: &Path) -> Result<()> {
+    std::env::set_current_dir(root)?;
+    // The old root is stacked on top of the new one at ".", then detached.
+    pivot_root(".", ".").context("pivot_root")?;
+    unmount(".", UnmountFlags::DETACH).context("detaching the old root")?;
+    std::env::set_current_dir("/")?;
+    Ok(())
+}
+
+/// As runc does: `/proc/sys` becomes read-only (a root step could otherwise
+/// set `core_pattern` to run a binary outside the namespaces) and files that
+/// leak or control the VM are covered with the step's `/dev/null`.
+fn mask_proc(root: &Path) -> Result<()> {
+    let sys = root.join("proc/sys");
+    mount_bind(&sys, &sys).context("binding /proc/sys")?;
+    mount_remount(
+        &sys,
+        MountFlags::BIND
+            | MountFlags::RDONLY
+            | MountFlags::NOSUID
+            | MountFlags::NODEV
+            | MountFlags::NOEXEC,
+        "",
+    )
+    .context("making /proc/sys read-only")?;
+    let null = root.join("dev/null");
+    for name in ["sysrq-trigger", "kcore", "keys", "timer_list"] {
+        let target = root.join("proc").join(name);
+        if target.exists() {
+            mount_bind(&null, &target).with_context(|| format!("masking /proc/{name}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Removes every capability outside `ALLOWED_CAPS`. Without this a root step
 /// could mknod the store disk, or mount things, and poison cached layers of
-/// other images. This deliberately deviates from Docker: a step cannot mknod.
+/// other images. The inheritable set stays empty, as in runc, so nothing is
+/// inherited across exec. This deliberately deviates from Docker: a step cannot mknod.
 fn drop_capabilities() -> Result<()> {
     for cap in 0..u64::BITS {
         let bit = CapabilitySet::from_bits_retain(1 << cap);
@@ -261,7 +303,7 @@ fn drop_capabilities() -> Result<()> {
         CapabilitySets {
             effective: ALLOWED_CAPS,
             permitted: ALLOWED_CAPS,
-            inheritable: ALLOWED_CAPS,
+            inheritable: CapabilitySet::empty(),
         },
     )
     .context("restricting capabilities")

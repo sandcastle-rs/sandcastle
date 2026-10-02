@@ -403,11 +403,15 @@ fn run_cannot_reach_the_store_disk() {
     let base = busybox(&store);
     let script = "mknod /tmp/vda b 254 0 2>/dev/null || echo blocked > /m1; \
                   mkdir -p /mnt; mount -t tmpfs none /mnt 2>/dev/null || echo blocked > /m2; \
-                  touch /f && chown 65534 /f && echo ok > /m3";
+                  touch /f && chown 65534 /f && echo ok > /m3; \
+                  mkdir /x && chroot /x /bin/true 2>/dev/null; \
+                  grep -c ' /store' /proc/self/mountinfo > /m4; \
+                  test ! -e /store/layers && echo ok > /m6; \
+                  echo x > /proc/sys/kernel/core_pattern 2>/dev/null || echo blocked > /m5";
     let (finished, _) = run_step(&vm, &store, &base, &run_job(base.clone(), script, ""));
     assert_eq!(finished.status.exit_code, 0);
     let entries = layer_entries(&finished.out_dir());
-    for marker in ["m1", "m2", "m3"] {
+    for marker in ["m1", "m2", "m3", "m4", "m5", "m6"] {
         assert!(
             entries.contains_key(marker),
             "{marker} missing: {:?}",
@@ -416,4 +420,9 @@ fn run_cannot_reach_the_store_disk() {
     }
     assert_eq!(entries["m1"].2, b"blocked\n");
     assert_eq!(entries["m2"].2, b"blocked\n");
+    assert_eq!(
+        entries["m4"].2, b"0\n",
+        "the store is still mounted in the step"
+    );
+    assert_eq!(entries["m5"].2, b"blocked\n");
 }
