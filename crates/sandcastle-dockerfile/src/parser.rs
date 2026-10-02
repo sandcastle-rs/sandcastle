@@ -76,6 +76,8 @@ pub enum ParseErrorKind {
     NotStringArray,
     /// BuildKit would read a heredoc body here; heredocs are not supported yet.
     Heredoc,
+    /// `ONBUILD ONBUILD ...`, which BuildKit forbids.
+    ChainedOnbuild,
 }
 
 impl fmt::Display for ParseErrorKind {
@@ -97,6 +99,9 @@ impl fmt::Display for ParseErrorKind {
                 "when using JSON array syntax, arrays must be comprised of strings only",
             ),
             Self::Heredoc => f.write_str("heredocs are not supported yet"),
+            Self::ChainedOnbuild => {
+                f.write_str("Chaining ONBUILD via `ONBUILD ONBUILD` isn't allowed")
+            }
         }
     }
 }
@@ -301,6 +306,18 @@ fn split_directive(s: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chained_onbuild_is_rejected_without_recursion() {
+        let err = parse(&("ONBUILD ".repeat(100_000) + "RUN x")).unwrap_err();
+        assert_eq!(err.kind(), &ParseErrorKind::ChainedOnbuild);
+        let err = parse("FROM a\nONBUILD ONBUILD RUN x").unwrap_err();
+        assert_eq!(err.line(), 2);
+        assert_eq!(err.kind(), &ParseErrorKind::ChainedOnbuild);
+        let err = parse("onbuild   OnBuild run x").unwrap_err();
+        assert_eq!(err.kind(), &ParseErrorKind::ChainedOnbuild);
+        assert!(parse("ONBUILD RUN x").is_ok());
+    }
 
     #[test]
     fn continuation_rules_follow_buildkit_regex() {

@@ -27,7 +27,9 @@ fn case_dirs(rel: &str) -> Vec<PathBuf> {
 #[test]
 fn parser_testfiles_match_buildkit_dump() {
     let mut failures = Vec::new();
-    for dir in case_dirs("parser/testfiles") {
+    let dirs = case_dirs("parser/testfiles");
+    assert_eq!(dirs.len(), 33, "vendored positive parser cases");
+    for dir in dirs {
         let src = fs::read_to_string(dir.join("Dockerfile")).expect("Dockerfile");
         let expected = fs::read_to_string(dir.join("result")).expect("result");
         match parse(&src) {
@@ -50,7 +52,9 @@ fn parser_testfiles_match_buildkit_dump() {
 
 #[test]
 fn parser_negative_testfiles_fail() {
-    for dir in case_dirs("parser/testfiles-negative") {
+    let dirs = case_dirs("parser/testfiles-negative");
+    assert_eq!(dirs.len(), 4, "vendored negative parser cases");
+    for dir in dirs {
         let src = fs::read_to_string(dir.join("Dockerfile")).expect("Dockerfile");
         assert!(
             parse(&src).is_err(),
@@ -109,7 +113,7 @@ fn shell_env_var_test_matches_buildkit() {
         }
         checked += 1;
     }
-    assert!(checked > 200, "only {checked} cases ran");
+    assert_eq!(checked, 228, "envVarTest cases checked");
 }
 
 /// `wordsTest`: `ENV k=v` lines extend the environment; `input | w1,w2`
@@ -118,6 +122,7 @@ fn shell_env_var_test_matches_buildkit() {
 fn shell_words_test_matches_buildkit() {
     let data = fs::read_to_string(testdata("shell/wordsTest")).expect("wordsTest");
     let mut env = HashMap::new();
+    let mut checked = 0;
     for (n, line) in data.lines().enumerate() {
         if line.starts_with('#') {
             continue;
@@ -137,5 +142,7 @@ fn shell_words_test_matches_buildkit() {
         let got =
             expand_words(input.trim(), &env, '\\').unwrap_or_else(|_| vec!["error".to_owned()]);
         assert_eq!(got, expected, "line {}: {input:?}", n + 1);
+        checked += 1;
     }
+    assert_eq!(checked, 24, "wordsTest cases checked");
 }

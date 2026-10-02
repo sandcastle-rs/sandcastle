@@ -56,8 +56,10 @@ pub enum Instruction {
     Expose(Vec<String>),
     Cmd(Command),
     Entrypoint(Command),
-    /// A valid instruction without a typed form here (ADD, ARG, HEALTHCHECK,
-    /// MAINTAINER, ONBUILD, SHELL, STOPSIGNAL, VOLUME).
+    /// A known instruction without a typed form here (ADD, ARG, HEALTHCHECK,
+    /// MAINTAINER, ONBUILD, SHELL, STOPSIGNAL, VOLUME). Only ONBUILD's trigger
+    /// is validated; the others are carried as parsed and callers decide how
+    /// much to check.
     Other(Node),
 }
 
@@ -93,7 +95,14 @@ pub enum InstructionErrorKind {
     UnknownFlag(String),
     DuplicateFlag(String),
     MissingFlagValue(String),
-    NotBoolean { flag: String, value: String },
+    NotBoolean {
+        flag: String,
+        value: String,
+    },
+    /// ONBUILD cannot trigger this instruction.
+    ForbiddenOnbuild(String),
+    /// ENV/LABEL arguments that are not key, value, separator triples.
+    MalformedPairs(&'static str),
 }
 
 impl fmt::Display for InstructionErrorKind {
@@ -118,6 +127,8 @@ impl fmt::Display for InstructionErrorKind {
             Self::NotBoolean { flag, value } => {
                 write!(f, "expecting boolean value for flag {flag}, not: {value}")
             }
+            Self::ForbiddenOnbuild(cmd) => write!(f, "{cmd} isn't allowed as an ONBUILD trigger"),
+            Self::MalformedPairs(cmd) => write!(f, "{cmd} arguments are not key/value pairs"),
         }
     }
 }
@@ -222,8 +233,22 @@ fn typed(node: &Node) -> Result<Instruction, InstructionErrorKind> {
             parse_flags(&node.flags, &[])?;
             Instruction::Entrypoint(command(node))
         }
-        "add" | "arg" | "healthcheck" | "maintainer" | "onbuild" | "shell" | "stopsignal"
-        | "volume" => Instruction::Other(node.clone()),
+        "onbuild" => {
+            let Some(sub) = node.sub.as_deref() else {
+                return Err(E::AtLeastOneArgument("ONBUILD"));
+            };
+            if ["onbuild", "from", "maintainer"]
+                .iter()
+                .any(|f| sub.cmd.eq_ignore_ascii_case(f))
+            {
+                return Err(E::ForbiddenOnbuild(sub.cmd.clone()));
+            }
+            Instruction::try_from(sub).map_err(|e| e.kind)?;
+            Instruction::Other(node.clone())
+        }
+        "add" | "arg" | "healthcheck" | "maintainer" | "shell" | "stopsignal" | "volume" => {
+            Instruction::Other(node.clone())
+        }
         _ => return Err(E::UnknownInstruction(node.cmd.clone())),
     })
 }
@@ -256,7 +281,7 @@ fn key_values(args: &[String], cmd: &'static str) -> Result<Vec<KeyValue>, Instr
                 key: key.clone(),
                 value: value.clone(),
             }),
-            _ => unreachable!("the parser emits complete key/value/separator triples"),
+            _ => Err(InstructionErrorKind::MalformedPairs(cmd)),
         })
         .collect()
 }
@@ -471,6 +496,45 @@ mod tests {
             one("EXPOSE").unwrap_err().kind(),
             &InstructionErrorKind::AtLeastOneArgument("EXPOSE")
         );
+    }
+
+    #[test]
+    fn onbuild_triggers_are_validated() {
+        assert!(matches!(
+            one("ONBUILD RUN x").unwrap(),
+            Instruction::Other(_)
+        ));
+        let cases = [
+            (
+                "ONBUILD",
+                InstructionErrorKind::AtLeastOneArgument("ONBUILD"),
+            ),
+            (
+                "ONBUILD FROM b",
+                InstructionErrorKind::ForbiddenOnbuild("FROM".into()),
+            ),
+            (
+                "onbuild maintainer x",
+                InstructionErrorKind::ForbiddenOnbuild("maintainer".into()),
+            ),
+            (
+                "ONBUILD COPY --mode=1 a b",
+                InstructionErrorKind::UnknownFlag("--mode".into()),
+            ),
+        ];
+        for (src, kind) in cases {
+            let err = one(&format!("FROM a\n{src}")).unwrap_err();
+            assert_eq!(err.kind(), &kind, "{src}");
+            assert_eq!(err.line(), 2, "{src}");
+        }
+    }
+
+    #[test]
+    fn malformed_key_value_args_are_an_error() {
+        let mut node = parse("ENV a=b").unwrap().nodes.remove(0);
+        node.args = vec!["a".into(), "b".into()];
+        let err = Instruction::try_from(&node).unwrap_err();
+        assert_eq!(err.kind(), &InstructionErrorKind::MalformedPairs("ENV"));
     }
 
     #[test]

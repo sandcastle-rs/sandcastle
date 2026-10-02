@@ -26,6 +26,9 @@ impl<S: BuildHasher> Env for HashMap<String, String, S> {
     }
 }
 
+/// Deepest `${VAR:-${...}}` nesting accepted; bounds recursion on hostile input.
+const MAX_NESTING: usize = 64;
+
 /// Why an argument could not be expanded.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("failed to process {word:?}: {kind}")]
@@ -38,16 +41,23 @@ impl ExpandError {
     pub fn word(&self) -> &str {
         &self.word
     }
+
+    pub fn kind(&self) -> &ExpandErrorKind {
+        &self.kind
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ExpandErrorKind {
+#[non_exhaustive]
+pub enum ExpandErrorKind {
     UnterminatedSingleQuote,
     UnterminatedDoubleQuote,
     Unterminated(char),
     MissingBrace,
     BadSubstitution,
     UnsupportedModifier(String),
+    /// `${...}` nested deeper than the supported limit.
+    TooDeep,
     /// `${VAR?msg}` / `${VAR:?msg}` on an unset (or empty) variable.
     Required {
         name: String,
@@ -71,6 +81,7 @@ impl fmt::Display for ExpandErrorKind {
             Self::MissingBrace => f.write_str("syntax error: missing '}'"),
             Self::BadSubstitution => f.write_str("syntax error: bad substitution"),
             Self::UnsupportedModifier(m) => write!(f, "unsupported modifier ({m}) in substitution"),
+            Self::TooDeep => write!(f, "substitutions nested deeper than {MAX_NESTING} levels"),
             Self::Required { name, message } => write!(f, "{name}: {message}"),
         }
     }
@@ -96,6 +107,7 @@ struct Lexer<'a, E> {
     chars: Peekable<Chars<'a>>,
     env: &'a E,
     escape: char,
+    depth: usize,
 }
 
 /// Word splitting that follows BuildKit's `wordsStruct`: characters from
@@ -148,6 +160,7 @@ impl<'a, E: Env> Lexer<'a, E> {
             chars: source.chars().peekable(),
             env,
             escape,
+            depth: 0,
         }
     }
 
@@ -286,7 +299,13 @@ impl<'a, E: Env> Lexer<'a, E> {
             }
             None => return Err(ExpandErrorKind::MissingBrace),
         };
-        let (word, _) = self.until(Some('}')).map_err(|e| match e {
+        if self.depth >= MAX_NESTING {
+            return Err(ExpandErrorKind::TooDeep);
+        }
+        self.depth += 1;
+        let word = self.until(Some('}'));
+        self.depth -= 1;
+        let (word, _) = word.map_err(|e| match e {
             ExpandErrorKind::Unterminated('}') => ExpandErrorKind::MissingBrace,
             e => e,
         })?;
@@ -371,6 +390,21 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn deep_nesting_is_an_error_not_an_abort() {
+        let err = expand(&"${A:-".repeat(100_000), &env(), '\\').unwrap_err();
+        assert_eq!(err.kind(), &ExpandErrorKind::TooDeep);
+        let ten = "${X:-".repeat(10) + "ok" + &"}".repeat(10);
+        assert_eq!(expand(&ten, &env(), '\\').unwrap(), "ok");
+        let at_cap = "${X:-".repeat(MAX_NESTING) + "ok" + &"}".repeat(MAX_NESTING);
+        assert_eq!(expand(&at_cap, &env(), '\\').unwrap(), "ok");
+        let over = "${X:-".repeat(MAX_NESTING + 1) + "ok" + &"}".repeat(MAX_NESTING + 1);
+        assert_eq!(
+            expand(&over, &env(), '\\').unwrap_err().kind(),
+            &ExpandErrorKind::TooDeep
+        );
     }
 
     #[test]

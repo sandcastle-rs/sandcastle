@@ -18,6 +18,12 @@ fn split_once_blank(s: &str) -> (&str, Option<&str>) {
 
 /// Parses one logical line into a node (line numbers are filled in by the caller).
 pub(crate) fn node_from_line(line: &str, escape: char) -> Result<Node, ParseErrorKind> {
+    parse_line(line, escape, false)
+}
+
+/// `in_onbuild` is set for an ONBUILD trigger, which may not be ONBUILD again;
+/// this keeps the recursion at most one level deep.
+fn parse_line(line: &str, escape: char, in_onbuild: bool) -> Result<Node, ParseErrorKind> {
     let (cmd, flags, rest) = split_command(line, escape);
     let mut node = Node {
         cmd: cmd.to_owned(),
@@ -38,7 +44,8 @@ pub(crate) fn node_from_line(line: &str, escape: char) -> Result<Node, ParseErro
         "expose" | "from" => node.args = split_blank(rest),
         "maintainer" | "stopsignal" | "user" | "workdir" => node.args = single(rest),
         "healthcheck" => (node.args, node.json) = health_config(rest)?,
-        "onbuild" if !rest.is_empty() => node.sub = Some(Box::new(node_from_line(rest, escape)?)),
+        "onbuild" if in_onbuild => return Err(ParseErrorKind::ChainedOnbuild),
+        "onbuild" if !rest.is_empty() => node.sub = Some(Box::new(parse_line(rest, escape, true)?)),
         "onbuild" => {}
         // BuildKit keeps unknown instructions with one empty argument and
         // leaves rejecting them to the typed layer.
