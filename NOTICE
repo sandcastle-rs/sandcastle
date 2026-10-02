@@ -6,3 +6,9 @@ sandcastle release archives bundle third-party components in lib/:
   LGPL-2.1-only; embedded Linux kernel GPL-2.0-only. Licenses in
   lib/licenses/. The exact source tag is recorded in lib/PROVENANCE;
   kernel source and patches are available from that libkrunfw tag.
+
+The sandcastle-dockerfile crate ports BuildKit's frontend/dockerfile parser,
+instructions and shell packages (https://github.com/moby/buildkit,
+Apache-2.0). Its tests vendor BuildKit fixtures under
+crates/sandcastle-dockerfile/testdata/buildkit/ with BuildKit's LICENSE; the
+pinned commit is in testdata/buildkit/SOURCE.

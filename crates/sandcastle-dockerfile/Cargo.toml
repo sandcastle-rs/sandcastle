@@ -1,0 +1,9 @@
+[package]
+name = "sandcastle-dockerfile"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json = "1.0.151"
+thiserror = "2.0.21"

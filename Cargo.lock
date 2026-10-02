@@ -319,6 +319,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-dockerfile"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "sandcastle-guest"
 version = "0.1.0"
 dependencies = [

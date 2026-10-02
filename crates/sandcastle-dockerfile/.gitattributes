@@ -1,0 +1,2 @@
+# Vendored BuildKit fixtures are compared byte for byte.
+testdata/** -text
