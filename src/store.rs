@@ -16,6 +16,8 @@ use crate::install::Install;
 pub const GUEST_HELPER_PATH: &str = "/sandcastle-guest";
 /// Mount points libkrun's init and the guest helper expect on the root share.
 const GUEST_DIRS: &[&str] = &["dev", "proc", "sys", "tmp", "out", "store"];
+/// Largest single template record accepted, bounding the read buffer.
+const MAX_EXTENT: u32 = 64 << 20;
 const TEMPLATE_MAGIC: &[u8; 4] = b"SCX1";
 
 pub struct Store {
@@ -90,13 +92,27 @@ impl Store {
 
     fn prepare_guest_root(&self, helper: &Path) -> Result<()> {
         let guest_root = self.guest_root();
+        fs::create_dir_all(&guest_root)?;
+        // The guest can write to its root, so never follow links planted there.
         for dir in GUEST_DIRS {
-            fs::create_dir_all(guest_root.join(dir))?;
+            let path = guest_root.join(dir);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => continue,
+                Ok(_) => fs::remove_file(&path)?,
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            fs::create_dir(&path)?;
         }
         let want = fs::read(helper).with_context(|| format!("reading {}", helper.display()))?;
         let dest = guest_root.join(GUEST_HELPER_PATH.trim_start_matches('/'));
-        if fs::read(&dest).ok().as_deref() != Some(&want[..]) {
-            let tmp = guest_root.join(".sandcastle-guest.tmp");
+        let current = match fs::symlink_metadata(&dest) {
+            Ok(meta) if meta.is_file() => fs::read(&dest).ok(),
+            _ => None,
+        };
+        if current.as_deref() != Some(&want[..]) {
+            // Stage in the host-only store root; rename replaces a planted link.
+            let tmp = self.root.join(".sandcastle-guest.tmp");
             fs::write(&tmp, &want)?;
             fs::set_permissions(&tmp, Permissions::from_mode(0o755))?;
             fs::rename(&tmp, &dest)?;
@@ -143,6 +159,7 @@ fn write_extents(src: &mut impl Read, path: &Path, size: u64) -> Result<()> {
         }
         let offset = u64::from_le_bytes(header[..8].try_into()?);
         let len = u32::from_le_bytes(header[8..].try_into()?);
+        ensure!(len <= MAX_EXTENT, "template extent too large ({len} bytes)");
         ensure!(
             offset
                 .checked_add(u64::from(len))
@@ -217,6 +234,49 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("past the end"), "{err:#}");
         assert!(!dir.path().join("d").exists());
+    }
+
+    #[test]
+    fn expand_sparse_rejects_oversized_extent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw = b"SCX1".to_vec();
+        raw.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        raw.extend_from_slice(&((64u32 << 20) + 1).to_le_bytes());
+        let dest = dir.path().join("d");
+        let err = expand_sparse(&raw[..], &dest).unwrap_err();
+        assert!(format!("{err:#}").contains("extent too large"), "{err:#}");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn open_replaces_planted_symlinks_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, install) = fixture();
+        let root = dir.path().join("store");
+        drop(Store::open(&root, &install).unwrap());
+
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"precious").unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let guest_root = root.join("guest-root");
+        let helper = guest_root.join("sandcastle-guest");
+        fs::remove_file(&helper).unwrap();
+        symlink(&victim, &helper).unwrap();
+        fs::remove_dir(guest_root.join("tmp")).unwrap();
+        symlink(&outside, guest_root.join("tmp")).unwrap();
+        fs::write(&install.guest_bin, b"helper v2").unwrap();
+
+        drop(Store::open(&root, &install).unwrap());
+
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
+        let meta = fs::symlink_metadata(&helper).unwrap();
+        assert!(meta.is_file(), "helper is not a regular file");
+        assert_eq!(fs::read(&helper).unwrap(), b"helper v2");
+        let tmp = fs::symlink_metadata(guest_root.join("tmp")).unwrap();
+        assert!(tmp.is_dir() && !tmp.file_type().is_symlink());
     }
 
     #[test]

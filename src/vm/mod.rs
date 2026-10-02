@@ -67,15 +67,23 @@ pub fn run_job(exe: &Path, store: &Store, install: &Install, job: &Job) -> Resul
         .status()
         .with_context(|| format!("starting {}", exe.display()))?;
     let status = read_status(&out_dir.join(STATUS_FILE))?;
-    fs::remove_dir_all(&job_dir)?;
+    if let Err(e) = fs::remove_dir_all(&job_dir) {
+        eprintln!("sandcastle: could not remove {}: {e}", job_dir.display());
+    }
     outcome(exit.code(), status)
 }
 
 fn read_status(path: &Path) -> Result<Option<Status>> {
     match fs::read(path) {
-        Ok(bytes) => Ok(Some(
-            serde_json::from_slice(&bytes).context("parsing guest status")?,
-        )),
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(status) => Ok(Some(status)),
+            Err(e) => {
+                // The guest commits status atomically, so garbage means no commit.
+                let e = anyhow::Error::new(e).context("parsing guest status");
+                eprintln!("sandcastle: ignoring unreadable guest status: {e:#}");
+                Ok(None)
+            }
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -118,6 +126,17 @@ mod tests {
         let err = format!("{:#}", outcome(Some(127), None).unwrap_err());
         assert!(err.contains("setup failed"), "{err}");
         assert!(err.contains("127"), "{err}");
+    }
+
+    #[test]
+    fn unparseable_status_is_setup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        fs::write(&path, b"{\"exit_co").unwrap();
+        let status = read_status(&path).unwrap();
+        assert!(status.is_none());
+        let err = format!("{:#}", outcome(Some(0), status).unwrap_err());
+        assert!(err.contains("setup failed"), "{err}");
     }
 
     #[test]

@@ -33,9 +33,13 @@ fn run() -> Result<i32> {
             probe: Some(crate::probe::run()?),
         },
     };
-    let mut file = File::create(out.join(STATUS_FILE)).context("creating status file")?;
-    file.write_all(&serde_json::to_vec(&status)?)?;
+    // Write-then-rename so the host never sees a partial status.
+    let tmp = out.join(format!("{STATUS_FILE}.tmp"));
+    let mut file = File::create(&tmp).context("creating status file")?;
+    file.write_all(&serde_json::to_vec(&status)?)
+        .context("writing status")?;
     // The VM is torn down right after exit; make sure the host sees the bytes.
-    file.sync_all()?;
+    file.sync_all().context("writing status")?;
+    fs::rename(&tmp, out.join(STATUS_FILE)).context("writing status")?;
     Ok(status.exit_code)
 }
