@@ -19,6 +19,10 @@ fn fixture(name: &str) -> PathBuf {
 /// Runs `sandcastle build` with a store shared by all build tests, so base
 /// images are pulled once per `just it` run.
 fn build(context: &Path, dockerfile: Option<&Path>, out: &Path) -> Output {
+    build_with(context, dockerfile, out, &[])
+}
+
+fn build_with(context: &Path, dockerfile: Option<&Path>, out: &Path, extra: &[&str]) -> Output {
     let bin = PathBuf::from(std::env::var_os("SANDCASTLE_BIN").expect("SANDCASTLE_BIN"));
     let store = bin.parent().unwrap().join("store");
     let mut cmd = Command::new(&bin);
@@ -27,6 +31,7 @@ fn build(context: &Path, dockerfile: Option<&Path>, out: &Path) -> Output {
         cmd.arg("-f").arg(f);
     }
     let output = cmd
+        .args(extra)
         .arg(context)
         .env("SANDCASTLE_ROOT", store)
         .output()
@@ -252,4 +257,62 @@ fn unknown_user_fails_step() {
         stderr.contains("unable to find user nosuchuser"),
         "{stderr}"
     );
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn timings_and_trace_show_guest_phases() {
+    let ctx = tempfile::tempdir().unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    std::fs::write(
+        &dockerfile,
+        "FROM mirror.gcr.io/library/alpine:3.20\nRUN echo one >/one && echo two\n",
+    )
+    .unwrap();
+    let trace = ctx.path().join("trace.json");
+    let output = build_with(
+        ctx.path(),
+        Some(&dockerfile),
+        &ctx.path().join("out"),
+        &["--timings", "--trace", trace.to_str().unwrap()],
+    );
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[2/2] done in "), "{stderr}");
+    for phase in ["kernel boot", "vmm", "command", "commit", "ingest"] {
+        assert!(stderr.contains(phase), "{phase} missing: {stderr}");
+    }
+    assert!(stderr.contains("Steps by duration:"), "{stderr}");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&trace).unwrap()).unwrap();
+    let names: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect();
+    for n in [
+        "build",
+        "pull",
+        "vm",
+        "kernel boot",
+        "command",
+        "cmd: echo two",
+        "ingest",
+        "write layout",
+    ] {
+        assert!(names.iter().any(|x| x == n), "{n} missing: {names:?}");
+    }
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn failing_chain_names_its_command() {
+    let stderr = failing_build("RUN true && printf '\\033[2J' >/dev/null && false && true\n");
+    assert!(
+        stderr.contains("exited with 1; last command started: false ("),
+        "{stderr}"
+    );
+    assert!(stderr.contains("s into the step)"), "{stderr}");
+    // The printf's escape sequence is displayed escaped, never raw.
+    assert!(!stderr.contains('\u{1b}'), "raw escape in output");
 }
