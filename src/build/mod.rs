@@ -100,7 +100,12 @@ fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descript
     eprintln!("[1/{total}] FROM {}", recipe.base);
     let t0 = Instant::now();
     let image = timed(trace, "pull", || registry::pull(&blobs, &recipe.base))?;
-    eprintln!("[1/{total}] done in {:.2}s", t0.elapsed().as_secs_f64());
+    let pulled = t0.elapsed();
+    eprintln!("[1/{total}] done in {:.2}s", pulled.as_secs_f64());
+    let mut step_times = vec![(
+        format!("step 1/{total} FROM {}", shown(&recipe.base)),
+        pulled,
+    )];
     let mut stage = Stage::new(
         ConfigState::from_base(&image.config, image.layers)?,
         recipe.escape,
@@ -125,34 +130,31 @@ fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descript
         eprintln!("[{n}/{total}] {}", shown(&step.text));
         let t0 = Instant::now();
         let result = run_step(&env, trace, &mut stage, step, (n, total));
+        let dur = t0.elapsed();
         trace.push(Span {
             name: label.clone(),
             start: trace.at(t0),
-            dur: t0.elapsed(),
+            dur,
             args: Vec::new(),
         });
+        step_times.push((label.clone(), dur));
         result.context(label)?;
     }
     let descriptor = timed(trace, "write layout", || {
         image::write_layout(&blobs, &stage.state, &opts.output, &opts.tag)
     })?;
     if opts.timings {
-        print_summary(trace);
+        print_summary(step_times);
     }
     Ok(descriptor)
 }
 
-/// Prints the step spans, longest first.
-fn print_summary(trace: &Trace) {
-    let mut steps: Vec<&Span> = trace
-        .spans()
-        .iter()
-        .filter(|s| s.name.starts_with("step "))
-        .collect();
-    steps.sort_by_key(|s| std::cmp::Reverse(s.dur));
+/// Prints the step durations, longest first.
+fn print_summary(mut steps: Vec<(String, Duration)>) {
+    steps.sort_by_key(|(_, dur)| std::cmp::Reverse(*dur));
     eprintln!("Steps by duration:");
-    for s in steps {
-        eprintln!("  {:>8.2}s  {}", s.dur.as_secs_f64(), s.name);
+    for (label, dur) in steps {
+        eprintln!("  {:>8.2}s  {label}", dur.as_secs_f64());
     }
 }
 
@@ -233,27 +235,33 @@ fn run_step(
 
     let status = &finished.status;
     if status.exit_code != 0 {
-        let last = events.as_ref().and_then(|ev| {
-            let cmd = ev.cmds.last()?;
-            let at = events::helper_start(ev, vm_end)? + Duration::from_micros(cmd.start_us);
-            Some((cmd, at.saturating_sub(step_start)))
-        });
+        let last = guest
+            .iter()
+            .rfind(|s| s.name.starts_with("cmd: "))
+            .zip(events.as_ref().and_then(|ev| ev.cmds.last()));
         match last {
-            Some((cmd, at)) => bail!(
+            Some((span, cmd)) => bail!(
                 "exited with {}; last command started: {} ({:.1}s into the step)",
                 status.exit_code,
                 events::display_safe(&cmd.text),
-                at.as_secs_f64()
+                span.start.saturating_sub(step_start).as_secs_f64()
             ),
             None => bail!("exited with {}", status.exit_code),
         }
     }
+    let mut ingested = Duration::ZERO;
     match &status.layer {
         None => stage.state.add_empty(&step.text)?,
         Some(diff_id) => {
-            let layer = timed(trace, "ingest", || {
-                ingest(env.blobs, &finished.out_dir().join(LAYER_FILE), diff_id)
-            })?;
+            let t0 = Instant::now();
+            let layer = ingest(env.blobs, &finished.out_dir().join(LAYER_FILE), diff_id)?;
+            ingested = t0.elapsed();
+            trace.push(Span {
+                name: "ingest".into(),
+                start: trace.at(t0),
+                dur: ingested,
+                args: Vec::new(),
+            });
             stage.state.add_layer(layer, &step.text)?;
         }
     }
@@ -262,35 +270,32 @@ fn run_step(
         (trace.at(Instant::now()).saturating_sub(step_start)).as_secs_f64()
     );
     if env.opts.timings {
-        print_phases(trace, &guest, is_copy, shell_form);
+        eprint!("{}", phase_lines(&guest, ingested, is_copy, shell_form));
     }
     Ok(())
 }
 
-/// Prints one step's phase durations and, for traced shell-form RUN, its
-/// slowest commands.
-fn print_phases(trace: &Trace, guest: &[Span], is_copy: bool, shell_form: bool) {
+/// Formats one step's phase durations and, for traced shell-form RUN, its
+/// slowest commands. `guest` holds guest-named spans; `ingested` is measured
+/// on the host.
+fn phase_lines(guest: &[Span], ingested: Duration, is_copy: bool, shell_form: bool) -> String {
     let sum = |name: &str| -> f64 {
         guest
             .iter()
             .filter(|s| s.name == name)
-            .map(|s| s.dur.as_secs_f64())
-            .sum()
+            .map(|s| s.dur)
+            .sum::<Duration>()
+            .as_secs_f64()
     };
-    let ingest = trace
-        .spans()
-        .last()
-        .filter(|s| s.name == "ingest")
-        .map_or(0.0, |s| s.dur.as_secs_f64());
-    eprintln!(
-        "  kernel boot {:.2}s · vmm {:.2}s · unpack {:.2}s · {} {:.2}s · commit {:.2}s · ingest {:.2}s",
+    let main = if is_copy { "copy" } else { "command" };
+    let mut out = format!(
+        "  kernel boot {:.2}s · vmm {:.2}s · unpack {:.2}s · {main} {:.2}s · commit {:.2}s · ingest {:.2}s\n",
         sum("kernel boot"),
         sum("vmm setup"),
         sum("unpack"),
-        if is_copy { "copy" } else { "command" },
-        sum(if is_copy { "copy" } else { "command" }),
+        sum(main),
         sum("commit"),
-        ingest
+        ingested.as_secs_f64()
     );
     if shell_form {
         let mut cmds: Vec<&Span> = guest
@@ -299,13 +304,14 @@ fn print_phases(trace: &Trace, guest: &[Span], is_copy: bool, shell_form: bool) 
             .collect();
         cmds.sort_by_key(|s| std::cmp::Reverse(s.dur));
         for s in cmds.iter().take(5) {
-            eprintln!(
-                "    {:.2}s  {}",
+            out.push_str(&format!(
+                "    {:.2}s  {}\n",
                 s.dur.as_secs_f64(),
                 events::display_safe(&s.name["cmd: ".len()..])
-            );
+            ));
         }
     }
+    out
 }
 
 /// Gzips the guest's layer tar into the blob store and checks that the
@@ -330,5 +336,45 @@ fn shown(text: &str) -> String {
         format!("{}…", line.chars().take(SHOWN_CHARS).collect::<String>())
     } else {
         line.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(name: &str, ms: u64) -> Span {
+        Span {
+            name: name.into(),
+            start: Duration::ZERO,
+            dur: Duration::from_millis(ms),
+            args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn missing_phases_print_zero_and_slowest_commands_lead() {
+        let guest = [
+            span("kernel boot", 1500),
+            span("command", 3000),
+            span("cmd: fast", 10),
+            span("cmd: slow", 2000),
+        ];
+        let out = phase_lines(&guest, Duration::from_millis(250), false, true);
+        assert_eq!(
+            out,
+            "  kernel boot 1.50s · vmm 0.00s · unpack 0.00s · command 3.00s · commit 0.00s · ingest 0.25s\n    2.00s  slow\n    0.01s  fast\n"
+        );
+    }
+
+    #[test]
+    fn copy_steps_show_copy_and_no_commands() {
+        let guest = [span("copy", 40), span("cmd: x", 5)];
+        let out = phase_lines(&guest, Duration::ZERO, true, false);
+        assert!(
+            out.contains("copy 0.04s") && !out.contains("command"),
+            "{out}"
+        );
+        assert_eq!(out.lines().count(), 1);
     }
 }

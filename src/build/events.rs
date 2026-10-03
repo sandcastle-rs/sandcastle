@@ -48,6 +48,19 @@ pub fn read(path: &Path) -> Result<Option<GuestEvents>> {
     Ok(Some(parse(&bytes)))
 }
 
+/// The phase names the guest helper emits. Anything else is not trusted
+/// to name a span, so it cannot pose as a host-side span in summaries.
+const PHASES: [&str; 8] = [
+    "store mount",
+    "unpack",
+    "overlay",
+    "command",
+    "copy",
+    "commit",
+    "sync",
+    "unmount",
+];
+
 pub fn parse(bytes: &[u8]) -> GuestEvents {
     let mut ev = GuestEvents::default();
     for line in bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
@@ -59,7 +72,9 @@ pub fn parse(bytes: &[u8]) -> GuestEvents {
                 start_us,
                 dur_us,
             }) => {
-                if ev.phases.len() < MAX_CMD_EVENTS {
+                if !PHASES.contains(&name.as_str()) {
+                    ev.malformed += 1;
+                } else if ev.phases.len() < MAX_CMD_EVENTS {
                     ev.phases.push(GuestPhase {
                         name: clip(name),
                         detail: detail.map(clip),
@@ -248,6 +263,25 @@ mod tests {
     }
 
     #[test]
+    fn unknown_phase_names_are_dropped() {
+        let ev = parse(
+            br#"{"type":"phase","name":"step 9/9 RUN x","start_us":1,"dur_us":2}
+{"type":"phase","name":"ingest","start_us":1,"dur_us":2}
+{"type":"phase","name":"unpack","start_us":1,"dur_us":2}
+{"type":"end","at_us":10}
+"#,
+        );
+        assert_eq!(ev.malformed, 2);
+        let spans = guest_spans(&ev, Duration::ZERO, Duration::from_millis(1));
+        assert!(spans.iter().any(|s| s.name == "unpack"));
+        assert!(
+            !spans
+                .iter()
+                .any(|s| s.name == "ingest" || s.name.starts_with("step"))
+        );
+    }
+
+    #[test]
     fn read_missing_file_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read(&dir.path().join("events.jsonl")).unwrap().is_none());
@@ -313,7 +347,7 @@ mod tests {
     fn phases_are_capped() {
         let mut input = String::new();
         for _ in 0..sandcastle_proto::MAX_CMD_EVENTS + 2 {
-            input.push_str("{\"type\":\"phase\",\"name\":\"p\",\"start_us\":1,\"dur_us\":1}\n");
+            input.push_str("{\"type\":\"phase\",\"name\":\"copy\",\"start_us\":1,\"dur_us\":1}\n");
         }
         let ev = parse(input.as_bytes());
         assert_eq!(ev.phases.len(), sandcastle_proto::MAX_CMD_EVENTS);
@@ -333,7 +367,7 @@ mod tests {
         let max = u64::MAX;
         let input = format!(
             "{{\"type\":\"boot\",\"kernel_boot_us\":{max}}}\n\
-             {{\"type\":\"phase\",\"name\":\"p\\u001b\",\"detail\":\"d\\u202e\",\"start_us\":{max},\"dur_us\":{max}}}\n\
+             {{\"type\":\"phase\",\"name\":\"unpack\",\"detail\":\"d\\u202e\",\"start_us\":{max},\"dur_us\":{max}}}\n\
              {{\"type\":\"cmd\",\"text\":\"x\",\"start_us\":{max}}}\n\
              {{\"type\":\"end\",\"at_us\":{max}}}\n"
         );
@@ -344,8 +378,7 @@ mod tests {
         for s in &spans {
             assert!(s.start >= a && s.start + s.dur <= b, "{s:?}");
         }
-        let p = spans.iter().find(|s| s.name.starts_with('p')).unwrap();
-        assert_eq!(p.name, "p\\x1b");
+        let p = spans.iter().find(|s| s.name == "unpack").unwrap();
         assert_eq!(p.args[0].1, "d\\u{202e}");
     }
 }
