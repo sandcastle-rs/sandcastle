@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::StreamExt;
-use oci_client::client::ClientConfig;
+use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::manifest::{ImageIndexEntry, OciDescriptor};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
@@ -66,10 +66,25 @@ pub fn default_tag(reference: &str) -> Result<String> {
     })
 }
 
+/// Docker's default: registries on the loopback interface speak plain HTTP,
+/// everything else HTTPS. `registry` is a reference's resolved host[:port].
+pub fn protocol_for(registry: &str) -> ClientProtocol {
+    let host = match registry.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => registry.split(':').next().unwrap_or(registry),
+    };
+    if host == "localhost" || host == "::1" || host.starts_with("127.") {
+        ClientProtocol::HttpsExcept(vec![registry.to_string()])
+    } else {
+        ClientProtocol::Https
+    }
+}
+
 async fn pull_async(blobs: &BlobStore<'_>, reference: &Reference) -> Result<PulledImage> {
     let arch = Arch::default();
     let resolver_arch = arch.clone();
     let client = Client::new(ClientConfig {
+        protocol: protocol_for(reference.resolve_registry()),
         // The default resolver matches the host OS, which is `darwin` on macOS.
         platform_resolver: Some(Box::new(move |entries: &[ImageIndexEntry]| {
             select_platform(entries, &resolver_arch)
@@ -299,6 +314,36 @@ pub(crate) fn layer_media_type(media_type: &str) -> Result<MediaType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn localhost_registries_use_plain_http() {
+        for host in [
+            "localhost:5000",
+            "localhost",
+            "127.0.0.1:5000",
+            "[::1]:5000",
+        ] {
+            assert!(
+                matches!(protocol_for(host), ClientProtocol::HttpsExcept(ref list) if list == &[host.to_string()]),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_registries_use_https() {
+        for host in [
+            "mirror.gcr.io",
+            "localhost.example.com:5000",
+            "10.0.0.5:5000",
+            "registry-1.docker.io",
+        ] {
+            assert!(
+                matches!(protocol_for(host), ClientProtocol::Https),
+                "{host}"
+            );
+        }
+    }
 
     /// Index entries in the shape registries serve, including a BuildKit
     /// attestation manifest (`unknown/unknown`).
