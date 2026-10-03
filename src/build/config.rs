@@ -17,7 +17,7 @@ const PROTOCOLS: [&str; 3] = ["tcp", "udp", "sctp"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Metadata,
-    Run { argv: Vec<String> },
+    Run { argv: Vec<String>, shell_form: bool },
     Copy { sources: Vec<String>, dest: String },
 }
 
@@ -83,6 +83,7 @@ impl Stage {
             Instruction::Run { command, .. } => {
                 return Ok(Action::Run {
                     argv: argv(command),
+                    shell_form: matches!(command, Command::Shell(_)),
                 });
             }
             Instruction::Copy { sources, dest, .. } => {
@@ -271,13 +272,15 @@ mod tests {
         assert_eq!(
             actions[1],
             Action::Run {
-                argv: vec!["/bin/sh".into(), "-c".into(), "echo $HOME".into()]
+                argv: vec!["/bin/sh".into(), "-c".into(), "echo $HOME".into()],
+                shell_form: true,
             }
         );
         assert_eq!(
             actions[2],
             Action::Run {
-                argv: vec!["a".into(), "b".into()]
+                argv: vec!["a".into(), "b".into()],
+                shell_form: false,
             }
         );
 

@@ -77,3 +77,27 @@ fn build_rejects_zero_cpus_and_memory() {
         );
     }
 }
+
+#[test]
+fn trace_file_is_written_when_the_build_fails() {
+    let ctx = tempfile::tempdir().unwrap();
+    std::fs::write(ctx.path().join("Dockerfile"), "FROM alpine\nARG X\n").unwrap();
+    let trace = ctx.path().join("trace.json");
+    let output = sandcastle()
+        .args(["build", "-t", "demo", "-o"])
+        .arg(ctx.path().join("out"))
+        .arg("--trace")
+        .arg(&trace)
+        .arg(ctx.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&trace).unwrap()).unwrap();
+    let names: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"build"), "{names:?}");
+}

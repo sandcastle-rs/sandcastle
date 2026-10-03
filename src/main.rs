@@ -59,6 +59,15 @@ enum Command {
         /// Memory per build-step VM, in MiB.
         #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..))]
         memory: u32,
+        /// Print each step's phases and a summary sorted by duration.
+        #[arg(long)]
+        timings: bool,
+        /// Write a Chrome trace (open in ui.perfetto.dev) to FILE, also on failure.
+        #[arg(long, value_name = "FILE")]
+        trace: Option<PathBuf>,
+        /// Run shell-form RUN without `sh -x` command tracing.
+        #[arg(long)]
+        no_trace_run: bool,
     },
     /// Internal: configure and enter a microVM for one job.
     #[command(name = "__vm", hide = true)]
@@ -80,7 +89,26 @@ fn main() -> ExitCode {
             output,
             cpus,
             memory,
-        } => build(context, file, tag, output, cpus, memory),
+            timings,
+            trace,
+            no_trace_run,
+        } => {
+            let mut resources = Resources::default();
+            if let Some(cpus) = cpus {
+                resources.vcpus = cpus;
+            }
+            resources.ram_mib = memory;
+            build(sandcastle::build::Options {
+                dockerfile: file.unwrap_or_else(|| context.join("Dockerfile")),
+                context,
+                output,
+                tag,
+                resources,
+                timings,
+                trace,
+                trace_run: !no_trace_run,
+            })
+        }
         Command::Vm { job_dir } => Err(vm::child::enter(&job_dir)),
     };
     match result {
@@ -120,27 +148,8 @@ fn pull(reference: &str, output: &Path, tag: Option<String>) -> anyhow::Result<(
     Ok(())
 }
 
-fn build(
-    context: PathBuf,
-    file: Option<PathBuf>,
-    tag: String,
-    output: PathBuf,
-    cpus: Option<u8>,
-    memory: u32,
-) -> anyhow::Result<()> {
+fn build(opts: sandcastle::build::Options) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let mut resources = Resources::default();
-    if let Some(cpus) = cpus {
-        resources.vcpus = cpus;
-    }
-    resources.ram_mib = memory;
-    let opts = sandcastle::build::Options {
-        dockerfile: file.unwrap_or_else(|| context.join("Dockerfile")),
-        context,
-        output,
-        tag,
-        resources,
-    };
     let manifest = sandcastle::build::build(&exe, &opts)?;
     println!(
         "{} {}:{}",
