@@ -36,10 +36,11 @@ skopeo reads `bench/registries.conf` (a minimal v2 file) through `CONTAINERS_REG
 
 ## Linux (Hetzner dedicated) setup
 
-Run `bench/setup-ubuntu.sh`, then seed and run as above. To compare both BuildKit flavours:
+Run `bench/setup-ubuntu.sh` from a clone of the repo as a sudo user on Ubuntu 24.04 with `/dev/kvm` (a dedicated server, not a cloud VM). It installs the packages, Rust, `just` and `buildctl`, builds the libraries and sandcastle, and runs `sandcastle doctor`. Then log out and back in (for the `kvm` and `docker` groups), seed the registry on port 5001 and run, comparing both BuildKit flavours:
 
 ```
-bench/run.sh --tools sandcastle,buildkit,buildkit-rootless
+bench/registry.sh start && bench/registry.sh seed
+just bench --tools sandcastle,buildkit,buildkit-rootless
 ```
 
 ## Troubleshooting
