@@ -3,15 +3,17 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 use std::process;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rustix::mount::{MountFlags, mount};
 use sandcastle_proto::{
-    CopyJob, JOB_FILE, Job, LAYER_FILE, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status,
+    CopyJob, EVENTS_FILE, JOB_FILE, Job, LAYER_FILE, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status,
 };
 
 use crate::commit;
 use crate::copy::Copy;
+use crate::events::Recorder;
 use crate::overlay::Overlay;
 use crate::store::Store;
 
@@ -36,6 +38,9 @@ pub fn main() -> ! {
 }
 
 fn job_main() -> Result<i32> {
+    let start = Instant::now();
+    let boot = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    let boot_us = boot.tv_sec as u64 * 1_000_000 + boot.tv_nsec as u64 / 1_000;
     mount(
         SHARE_OUT,
         OUT,
@@ -45,7 +50,12 @@ fn job_main() -> Result<i32> {
     )
     .context("mounting the out share")?;
     let out = Path::new(OUT);
-    let status = match read_job(out).and_then(|job| run_job(job, out)) {
+    // Failing to create the file only means there are no events.
+    let rec = Recorder::create(&out.join(EVENTS_FILE), start).ok();
+    if let Some(r) = &rec {
+        r.boot(boot_us);
+    }
+    let status = match read_job(out).and_then(|job| run_job(job, out, rec.as_ref())) {
         Ok(status) => status,
         Err(e) => {
             eprintln!("sandcastle-guest: {e:#}");
@@ -56,6 +66,10 @@ fn job_main() -> Result<i32> {
             }
         }
     };
+    if let Some(r) = rec {
+        // Events never decide a job's success; `status.json` alone does.
+        let _ = r.finish();
+    }
     write_status(out, &status)?;
     Ok(status.exit_code)
 }
@@ -65,30 +79,33 @@ fn read_job(out: &Path) -> Result<Job> {
         .context("parsing job")
 }
 
-fn run_job(job: Job, out: &Path) -> Result<Status> {
+fn run_job(job: Job, out: &Path, rec: Option<&Recorder>) -> Result<Status> {
     match job {
         Job::Probe { exit_code } => Ok(Status {
             exit_code,
             probe: Some(crate::probe::run()?),
             ..Default::default()
         }),
-        Job::Copy(job) => with_store(|store| copy_job(store, &job, out)),
-        Job::Run(job) => with_store(|store| crate::run::run_job(store, &job, out)),
+        Job::Copy(job) => with_store(rec, |store| copy_job(store, &job, out, rec)),
+        Job::Run(job) => with_store(rec, |store| crate::run::run_job(store, &job, out, rec)),
     }
 }
 
 /// Mounts the store for `f` and always unmounts it, so written layers reach
 /// the disk before the VM stops.
-pub fn with_store(f: impl FnOnce(&Store) -> Result<Status>) -> Result<Status> {
-    let store = Store::mount()?;
+pub fn with_store(
+    rec: Option<&Recorder>,
+    f: impl FnOnce(&Store) -> Result<Status>,
+) -> Result<Status> {
+    let store = phase(rec, "store mount", None, Store::mount)?;
     let result = f(&store);
-    let unmounted = store.unmount();
+    let unmounted = phase(rec, "unmount", None, || store.unmount());
     let status = result?;
     unmounted?;
     Ok(status)
 }
 
-fn copy_job(store: &Store, job: &CopyJob, out: &Path) -> Result<Status> {
+fn copy_job(store: &Store, job: &CopyJob, out: &Path, rec: Option<&Recorder>) -> Result<Status> {
     mount(
         SHARE_CTX,
         CTX,
@@ -97,26 +114,35 @@ fn copy_job(store: &Store, job: &CopyJob, out: &Path) -> Result<Status> {
         None::<&CStr>,
     )
     .context("mounting the build context")?;
-    store.ensure_layers(&job.lower)?;
+    store.ensure_layers(&job.lower, rec)?;
     let work = store.work("copy")?;
-    let overlay = Overlay::mount(&store.lower_dirs(&job.lower)?, &work)?;
+    let lowers = store.lower_dirs(&job.lower)?;
+    let overlay = phase(rec, "overlay", None, || Overlay::mount(&lowers, &work))?;
     let copy = Copy {
         ctx: Path::new(CTX),
         root: overlay.merged(),
         workdir: &job.workdir,
         owner: Some((0, 0)),
     };
-    let result = copy
-        .ensure_workdir()
-        .and_then(|()| copy.run(&job.sources, &job.dest));
+    let result = phase(rec, "copy", None, || {
+        copy.ensure_workdir()
+            .and_then(|()| copy.run(&job.sources, &job.dest))
+    });
     let upper = overlay.unmount()?;
     result?;
-    commit_upper(store, &upper, out)
+    commit_upper(store, &upper, out, rec)
 }
 
 /// Writes the step's layer and keeps its upper dir as the layer's store copy.
-pub fn commit_upper(store: &Store, upper: &Path, out: &Path) -> Result<Status> {
-    let layer = commit::commit(upper, &out.join(LAYER_FILE))?;
+pub fn commit_upper(
+    store: &Store,
+    upper: &Path,
+    out: &Path,
+    rec: Option<&Recorder>,
+) -> Result<Status> {
+    let layer = phase(rec, "commit", None, || {
+        commit::commit(upper, &out.join(LAYER_FILE))
+    })?;
     match &layer {
         Some(diff_id) => {
             let dest = store.layer_dir(diff_id)?;
@@ -124,7 +150,7 @@ pub fn commit_upper(store: &Store, upper: &Path, out: &Path) -> Result<Status> {
                 fs::remove_dir_all(upper)?;
             } else {
                 // A layer directory must be complete on disk once it exists.
-                store.sync()?;
+                phase(rec, "sync", None, || store.sync())?;
                 fs::rename(upper, &dest)?;
             }
         }
@@ -135,6 +161,19 @@ pub fn commit_upper(store: &Store, upper: &Path, out: &Path) -> Result<Status> {
         layer,
         ..Default::default()
     })
+}
+
+/// Times `f` as phase `name` when recording; plain call otherwise.
+pub fn phase<T>(
+    rec: Option<&Recorder>,
+    name: &str,
+    detail: Option<&str>,
+    f: impl FnOnce() -> T,
+) -> T {
+    match rec {
+        Some(r) => r.phase(name, detail, f),
+        None => f(),
+    }
 }
 
 fn write_status(out: &Path, status: &Status) -> Result<()> {
