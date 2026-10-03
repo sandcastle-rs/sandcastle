@@ -141,6 +141,56 @@ fn copy_job_writes_context_files_as_root() {
     assert_eq!(sandcastle::blobs::sha256(&bytes).to_string(), diff_id);
 }
 
+/// Files in the COPY context; well above the 1024 soft fd limit forced below.
+const MANY_FILES: usize = 3000;
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn copy_job_with_more_files_than_the_soft_fd_limit() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    // libkrun's virtio-fs server keeps a host fd per guest inode; force the
+    // common default soft limit so the test means the same on every machine.
+    let limit = getrlimit(Resource::Nofile);
+    setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(1024),
+            maximum: limit.maximum,
+        },
+    )
+    .unwrap();
+
+    let (dir, exe, install, store) = store();
+    let ctx = dir.path().join("ctx");
+    for i in 0..MANY_FILES {
+        let sub = ctx.join(format!("d{:02}", i % 30));
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(format!("f{i:04}")), i.to_string()).unwrap();
+    }
+    let job = Job::Copy(CopyJob {
+        lower: busybox(&store),
+        sources: vec![".".into()],
+        dest: "/data/".into(),
+        workdir: "/".into(),
+    });
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let finished = vm.run(&job, Some(&ctx)).unwrap();
+    setrlimit(Resource::Nofile, limit).unwrap();
+    assert_eq!(finished.status.exit_code, 0);
+    let entries = layer_entries(&finished.out_dir());
+    let files = entries
+        .values()
+        .filter(|(kind, ..)| *kind == tar::EntryType::Regular)
+        .count();
+    assert_eq!(files, MANY_FILES);
+}
+
 #[test]
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn copy_job_missing_source_is_a_guest_error() {
