@@ -44,3 +44,7 @@ fetch-libs:
 # Run a built image with podman (Linux CI): needs podman and skopeo.
 it-podman: it
     SANDCASTLE_LIBKRUN_DIR={{lib_dir}} SANDCASTLE_BIN={{it_bin}} cargo test --release -p sandcastle --test podman -- --ignored --test-threads=1
+
+# Benchmark against BuildKit (manual; see bench/README.md). Example: just bench --cases many-runs --runs 3
+bench *args: build
+    bench/run.sh {{args}}

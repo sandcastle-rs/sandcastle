@@ -1,0 +1,3 @@
+docker://mirror.gcr.io/library/alpine:3.20 library/alpine:3.20
+docker://mirror.gcr.io/library/debian:bookworm-slim library/debian:bookworm-slim
+docker://mirror.gcr.io/library/golang:1.25 library/golang:1.25
