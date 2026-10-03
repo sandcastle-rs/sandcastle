@@ -15,6 +15,8 @@ pub const EVENTS_FILE: &str = "events.jsonl";
 pub const MAX_CMD_EVENTS: usize = 10_000;
 /// Longest traced command text kept, in bytes.
 pub const MAX_CMD_TEXT: usize = 1024;
+/// Largest events file the host reads; the guest keeps below it.
+pub const MAX_EVENTS_BYTES: u64 = 8 << 20;
 
 /// Uncompressed layer tar a `run` or `copy` job leaves in `/out`.
 pub const LAYER_FILE: &str = "layer.tar";

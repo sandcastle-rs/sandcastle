@@ -6,13 +6,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
-use sandcastle_proto::{Event, MAX_CMD_EVENTS, MAX_CMD_TEXT};
+use sandcastle_proto::{Event, MAX_CMD_EVENTS, MAX_CMD_TEXT, MAX_EVENTS_BYTES};
 
 use crate::trace::Span;
 use crate::vm::open_guest_file;
-
-/// Largest events file read from the guest.
-const MAX_EVENTS_BYTES: u64 = 8 << 20;
 
 #[derive(Debug, Default)]
 pub struct GuestEvents {
@@ -86,12 +83,15 @@ pub fn parse(bytes: &[u8]) -> GuestEvents {
                 }
             }
             Ok(Event::Cmd { text, start_us }) => {
+                let cmd = GuestCmd {
+                    text: clip(text),
+                    start_us,
+                };
                 if ev.cmds.len() < MAX_CMD_EVENTS {
-                    ev.cmds.push(GuestCmd {
-                        text: clip(text),
-                        start_us,
-                    });
-                } else {
+                    ev.cmds.push(cmd);
+                } else if let Some(last) = ev.cmds.last_mut() {
+                    // Keep the last command started; it names a failure.
+                    *last = cmd;
                     ev.dropped = ev.dropped.saturating_add(1);
                 }
             }
@@ -260,6 +260,26 @@ mod tests {
         assert_eq!(ev.cmds.len(), sandcastle_proto::MAX_CMD_EVENTS);
         assert!(ev.dropped >= 3);
         assert_eq!(ev.end_us, Some(12_000));
+    }
+
+    #[test]
+    fn over_the_cap_the_newest_cmd_replaces_the_last_kept() {
+        let mut input = String::new();
+        for i in 0..MAX_CMD_EVENTS + 5 {
+            input.push_str(&format!(
+                "{{\"type\":\"cmd\",\"text\":\"x{i}\",\"start_us\":{i}}}\n"
+            ));
+        }
+        let ev = parse(input.as_bytes());
+        assert_eq!(ev.cmds.len(), MAX_CMD_EVENTS);
+        assert_eq!(
+            ev.cmds[MAX_CMD_EVENTS - 2].text,
+            format!("x{}", MAX_CMD_EVENTS - 2)
+        );
+        let last = ev.cmds.last().unwrap();
+        assert_eq!(last.text, format!("x{}", MAX_CMD_EVENTS + 4));
+        assert_eq!(last.start_us, (MAX_CMD_EVENTS + 4) as u64);
+        assert_eq!(ev.dropped, 5);
     }
 
     #[test]

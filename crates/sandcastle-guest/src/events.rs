@@ -10,11 +10,19 @@ use std::time::Instant;
 
 use sandcastle_proto::{Event, MAX_CMD_EVENTS};
 
+/// Bytes of `cmd` lines written per job, well below the host's
+/// `MAX_EVENTS_BYTES` so the events after them always fit.
+const CMD_BYTES_BUDGET: usize = 6 << 20;
+
 pub struct Recorder {
     file: RefCell<Option<File>>,
     start: Instant,
     cmds: Cell<usize>,
+    cmd_bytes: Cell<usize>,
     dropped: Cell<u64>,
+    /// Line of the most recent dropped cmd, written by `finish` so the last
+    /// cmd in the file is the last one started.
+    last_dropped: RefCell<Option<Vec<u8>>>,
     truncated: Cell<u64>,
 }
 
@@ -25,7 +33,9 @@ impl Recorder {
             file: RefCell::new(Some(file)),
             start,
             cmds: Cell::new(0),
+            cmd_bytes: Cell::new(0),
             dropped: Cell::new(0),
+            last_dropped: RefCell::new(None),
             truncated: Cell::new(0),
         })
     }
@@ -50,16 +60,27 @@ impl Recorder {
         value
     }
 
+    /// Records a traced command. Past the count or byte budget it is only
+    /// counted; one slot of `MAX_CMD_EVENTS` is kept for the last dropped
+    /// command, which `finish` writes.
     pub fn cmd(&self, text: &str, start_us: u64) {
-        if self.cmds.get() >= MAX_CMD_EVENTS {
-            self.dropped.set(self.dropped.get() + 1);
-            return;
-        }
-        self.cmds.set(self.cmds.get() + 1);
-        self.write(&Event::Cmd {
+        let line = encode(&Event::Cmd {
             text: text.to_string(),
             start_us,
         });
+        let bytes = self.cmd_bytes.get() + line.len();
+        // Once one is dropped, every later one is too: cmds stay in order.
+        let full = self.dropped.get() > 0
+            || self.cmds.get() >= MAX_CMD_EVENTS - 1
+            || bytes > CMD_BYTES_BUDGET;
+        if full {
+            self.dropped.set(self.dropped.get() + 1);
+            *self.last_dropped.borrow_mut() = Some(line);
+            return;
+        }
+        self.cmds.set(self.cmds.get() + 1);
+        self.cmd_bytes.set(bytes);
+        self.write_line(&line);
     }
 
     pub fn add_truncated(&self, n: u64) {
@@ -69,6 +90,10 @@ impl Recorder {
     /// Writes the limits and end events and syncs, so the host sees every
     /// event before it sees `status.json`.
     pub fn finish(self) -> io::Result<()> {
+        if let Some(line) = self.last_dropped.take() {
+            self.write_line(&line);
+            self.dropped.set(self.dropped.get() - 1);
+        }
         self.write(&Event::Limits {
             cmd_events_dropped: self.dropped.get(),
             truncated: self.truncated.get(),
@@ -83,15 +108,23 @@ impl Recorder {
     }
 
     fn write(&self, event: &Event) {
+        self.write_line(&encode(event));
+    }
+
+    fn write_line(&self, line: &[u8]) {
         let mut slot = self.file.borrow_mut();
         let Some(file) = slot.as_mut() else { return };
-        let mut line = serde_json::to_vec(event).expect("events serialize");
-        line.push(b'\n');
-        if let Err(e) = file.write_all(&line) {
+        if let Err(e) = file.write_all(line) {
             eprintln!("sandcastle-guest: not recording further events: {e}");
             *slot = None;
         }
     }
+}
+
+fn encode(event: &Event) -> Vec<u8> {
+    let mut line = serde_json::to_vec(event).expect("events serialize");
+    line.push(b'\n');
+    line
 }
 
 #[cfg(test)]
@@ -146,20 +179,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let rec = Recorder::create(&path, Instant::now()).unwrap();
-        for _ in 0..MAX_CMD_EVENTS + 5 {
-            rec.cmd("x", 1);
+        for i in 0..MAX_CMD_EVENTS + 5 {
+            rec.cmd(&format!("x{i}"), 1);
         }
         rec.add_truncated(2);
         rec.finish().unwrap();
         let events = read(&path);
-        let cmds = events
-            .iter()
-            .filter(|e| matches!(e, Event::Cmd { .. }))
-            .count();
-        assert_eq!(cmds, MAX_CMD_EVENTS);
+        let cmds = cmd_texts(&events);
+        assert_eq!(cmds.len(), MAX_CMD_EVENTS);
+        assert_eq!(
+            cmds.last().unwrap(),
+            &format!("x{}", MAX_CMD_EVENTS + 4),
+            "the last command started is kept"
+        );
         assert!(events.contains(&Event::Limits {
             cmd_events_dropped: 5,
             truncated: 2
         }));
+        assert!(matches!(events.last(), Some(Event::End { .. })));
+    }
+
+    #[test]
+    fn cmd_bytes_are_capped_below_the_host_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let rec = Recorder::create(&path, Instant::now()).unwrap();
+        // Control characters escape to six bytes each in JSON.
+        let text = "\u{1}".repeat(sandcastle_proto::MAX_CMD_TEXT);
+        for _ in 0..MAX_CMD_EVENTS + 5 {
+            rec.cmd(&text, 1);
+        }
+        rec.cmd("final", 2);
+        rec.finish().unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < sandcastle_proto::MAX_EVENTS_BYTES, "{size} bytes");
+        let events = read(&path);
+        let cmds = cmd_texts(&events);
+        assert_eq!(cmds.last().map(String::as_str), Some("final"));
+        let dropped = MAX_CMD_EVENTS + 6 - cmds.len();
+        assert!(events.contains(&Event::Limits {
+            cmd_events_dropped: dropped as u64,
+            truncated: 0
+        }));
+        assert!(matches!(events.last(), Some(Event::End { .. })));
+    }
+
+    fn cmd_texts(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Cmd { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }
