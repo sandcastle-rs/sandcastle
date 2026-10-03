@@ -8,7 +8,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use rustix::mount::{MountFlags, mount};
 use sandcastle_proto::{
-    CopyJob, EVENTS_FILE, JOB_FILE, Job, LAYER_FILE, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status,
+    CopyJob, EVENTS_FILE, JOB_FILE, Job, KMSG_ENV, KMSG_FILE, LAYER_FILE, MAX_KMSG_BYTES,
+    SHARE_CTX, SHARE_OUT, STATUS_FILE, Status,
 };
 
 use crate::commit;
@@ -69,6 +70,11 @@ fn job_main() -> Result<i32> {
     if let Some(r) = rec {
         // Events never decide a job's success; `status.json` alone does.
         let _ = r.finish();
+    }
+    if std::env::var_os(KMSG_ENV).is_some()
+        && let Err(e) = copy_kmsg(&out.join(KMSG_FILE))
+    {
+        eprintln!("sandcastle-guest: not saving the kernel log: {e}");
     }
     write_status(out, &status)?;
     Ok(status.exit_code)
@@ -174,6 +180,37 @@ pub fn phase<T>(
         Some(r) => r.phase(name, detail, f),
         None => f(),
     }
+}
+
+/// Copies the kernel's log ring buffer (one record per read, timestamped
+/// from the kernel's first instruction) for boot-time diagnosis.
+fn copy_kmsg(dest: &Path) -> std::io::Result<()> {
+    use std::io::{ErrorKind, Read};
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut kmsg = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open("/dev/kmsg")?;
+    let mut out = File::create(dest)?;
+    let mut buf = vec![0u8; 8192];
+    let mut written = 0u64;
+    loop {
+        match kmsg.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                written += n as u64;
+                if written > MAX_KMSG_BYTES {
+                    break;
+                }
+                out.write_all(&buf[..n])?;
+            }
+            // Records overwritten while reading: skip ahead.
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
+    }
+    out.sync_all()
 }
 
 fn write_status(out: &Path, status: &Status) -> Result<()> {

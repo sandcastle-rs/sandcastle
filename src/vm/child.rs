@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
-use sandcastle_proto::GUEST_HELPER_PATH;
+use sandcastle_proto::{GUEST_HELPER_PATH, KMSG_ENV};
 
 use super::krun::Krun;
 use super::{MARKS_FILE, SPEC_FILE, VmMarks, VmSpec, unix_ns};
@@ -38,7 +38,13 @@ fn try_enter(job_dir: &Path) -> Result<Infallible> {
         ctx.add_virtiofs(&share.tag, &share.path, share.read_only)?;
     }
     ctx.set_workdir("/")?;
-    ctx.set_exec(GUEST_HELPER_PATH, &[], &["HOME=/"])?;
+    let kmsg = format!("{KMSG_ENV}=1");
+    let env: &[&str] = if std::env::var_os(super::DEBUG_KMSG_ENV).is_some() {
+        &["HOME=/", &kmsg]
+    } else {
+        &["HOME=/"]
+    };
+    ctx.set_exec(GUEST_HELPER_PATH, &[], env)?;
     #[cfg(target_os = "linux")]
     super::landlock::restrict(&spec)?;
     let configured_ns = unix_ns();

@@ -11,6 +11,12 @@ pub const JOB_FILE: &str = "job.json";
 pub const STATUS_FILE: &str = "status.json";
 /// Append-only JSON lines the guest writes to `/out` for observability.
 pub const EVENTS_FILE: &str = "events.jsonl";
+/// Copy of the guest kernel's log, written only when [`KMSG_ENV`] is set.
+pub const KMSG_FILE: &str = "kmsg.txt";
+/// Guest helper environment variable that asks for [`KMSG_FILE`].
+pub const KMSG_ENV: &str = "SANDCASTLE_KMSG";
+/// Largest kernel log copied, in bytes.
+pub const MAX_KMSG_BYTES: u64 = 1 << 20;
 /// Most traced shell commands kept per step; the rest are counted only.
 pub const MAX_CMD_EVENTS: usize = 10_000;
 /// Longest traced command text kept, in bytes.
