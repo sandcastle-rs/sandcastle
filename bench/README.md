@@ -4,7 +4,7 @@ Manual benchmark; nothing here runs in CI.
 
 ## What it measures
 
-Wall-clock time of `sandcastle build` and `buildctl build` (BuildKit, in a container) producing an OCI layout, timed with hyperfine. Base images come from a local registry on `localhost:5000`, so registry latency is excluded.
+Wall-clock time of `sandcastle build` and `buildctl build` (BuildKit, in a container) producing an OCI layout, timed with hyperfine. Base images come from a local registry on `localhost:5001`, so registry latency is excluded.
 
 Cases (`bench/cases/`):
 
@@ -28,7 +28,7 @@ The package cases download from the internet in every run, so they include netwo
 3. `bench/registry.sh start && bench/registry.sh seed`
 4. `just bench` (runs `just build` first). Arguments are passed through, for example `just bench --cases many-runs --runs 3`.
 
-Port 5000 must be free. On macOS the AirPlay Receiver listens there by default; turn it off in System Settings > General > AirDrop & Handoff.
+The registry uses port 5001 because macOS AirPlay Receiver occupies 5000.
 
 `ENGINE` selects the container engine (`docker` or `podman`); default is `podman` on macOS and `docker` on Linux.
 
@@ -41,6 +41,10 @@ Run `bench/setup-ubuntu.sh`, then seed and run as above. To compare both BuildKi
 ```
 bench/run.sh --tools sandcastle,buildkit,buildkit-rootless
 ```
+
+## Troubleshooting
+
+`bench/lib.sh` sets `REGISTRY_AUTH_FILE` to `bench/auth.json` (empty) so a broken credential helper in your own container auth config cannot fail the anonymous pulls. Set the variable yourself to override.
 
 ## Reading results
 

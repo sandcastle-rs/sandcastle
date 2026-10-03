@@ -1,4 +1,4 @@
-FROM localhost:5000/library/alpine:3.20
+FROM localhost:5001/library/alpine:3.20
 RUN echo 1 > /step-1
 RUN echo 2 > /step-2
 RUN echo 3 > /step-3
