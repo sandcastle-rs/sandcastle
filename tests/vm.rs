@@ -628,3 +628,19 @@ fn exec_form_and_copy_jobs_still_record_phases() {
             .any(|e| matches!(e, Event::Phase { name, .. } if name == "commit"))
     );
 }
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn traced_run_finishes_with_a_leftover_background_process() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let job = shell_job(busybox(&store), "sleep 1000 & echo started > /started");
+    let finished = vm.run(&job, None).unwrap();
+    assert_eq!(finished.status.exit_code, 0);
+    assert!(finished.status.layer.is_some());
+}

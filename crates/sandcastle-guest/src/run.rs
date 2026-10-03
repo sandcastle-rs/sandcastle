@@ -153,6 +153,7 @@ fn execute(root: &Path, job: &RunJob, rec: Option<&Recorder>) -> Result<i32> {
     {
         let filter = MarkerFilter::new(&random_token()?);
         spec.argv = vec!["/bin/sh".into(), "-x".into(), "-c".into(), cmd.clone()];
+        spec.env.retain(|e| !e.starts_with("PS4="));
         spec.env.push(format!("PS4={}", filter.ps4()));
         command.arg(serde_json::to_string(&spec)?);
         return run_traced(command, filter, rec);
@@ -191,7 +192,11 @@ fn run_traced(mut command: Command, mut filter: MarkerFilter, rec: &Recorder) ->
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e).context("reading the step's stderr"),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e).context("reading the step's stderr");
+            }
         };
         filter.feed(&buf[..n], &mut out, &mut cmds);
         forward(&mut out, &mut cmds, rec);
