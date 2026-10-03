@@ -4,7 +4,13 @@
 mod copy;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod events;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod layer;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod trace_filter;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod user;
