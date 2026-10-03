@@ -197,7 +197,10 @@ pub fn guest_spans(ev: &GuestEvents, vm: &VmTimeline) -> Vec<Span> {
             spans.push(span("process start", vm_start, m.main - vm_start, vec![]));
             spans.push(span("libkrun load", m.main, m.loaded - m.main, vec![]));
             spans.push(span("vm configure", m.loaded, m.enter - m.loaded, vec![]));
-            spans.push(span("vm create", m.enter, kernel_start - m.enter, vec![]));
+            // libkrun's own VM setup is ~16 ms of this (strace on a bench
+            // box); the rest is the guest kernel running before its boot
+            // clock starts (early boot, CPU bring-up).
+            spans.push(span("early boot", m.enter, kernel_start - m.enter, vec![]));
         }
         None if kernel_start > vm_start => spans.push(span(
             "vmm setup",
@@ -433,7 +436,7 @@ mod tests {
             (ms(140), ms(11))
         );
         assert_eq!(
-            (find("vm create").start, find("vm create").dur),
+            (find("early boot").start, find("early boot").dur),
             (ms(151), ms(37))
         );
         assert_eq!(

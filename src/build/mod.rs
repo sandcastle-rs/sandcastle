@@ -323,11 +323,10 @@ fn vm_timeline(finished: &Finished, vm_start: Duration, vm_end: Duration) -> eve
 }
 
 /// Host-side VMM spans and their `--timings` labels, in order.
-const VMM_PARTS: [(&str, &str); 5] = [
+const VMM_PARTS: [(&str, &str); 4] = [
     ("process start", "spawn"),
     ("libkrun load", "load"),
     ("vm configure", "configure"),
-    ("vm create", "create"),
     ("vm teardown", "teardown"),
 ];
 
@@ -353,8 +352,14 @@ fn phase_lines(guest: &[Span], ingested: Duration, is_copy: bool, shell_form: bo
     } else {
         format!("{vmm:.2}s")
     };
+    // Measured only with the child's marks; see `events::guest_spans`.
+    let early = if marked {
+        format!("early boot {:.2}s · ", sum("early boot"))
+    } else {
+        String::new()
+    };
     let mut out = format!(
-        "  kernel boot {:.2}s · vmm {vmm} · unpack {:.2}s · {main} {:.2}s · commit {:.2}s · ingest {:.2}s\n",
+        "  {early}kernel boot {:.2}s · vmm {vmm} · unpack {:.2}s · {main} {:.2}s · commit {:.2}s · ingest {:.2}s\n",
         sum("kernel boot"),
         sum("unpack"),
         sum(main),
@@ -437,14 +442,15 @@ mod tests {
             span("process start", 10),
             span("libkrun load", 40),
             span("vm configure", 5),
-            span("vm create", 30),
+            span("early boot", 170),
+            span("kernel boot", 120),
             span("vm teardown", 15),
             span("command", 3000),
         ];
         let out = phase_lines(&guest, Duration::ZERO, false, false);
         assert!(
-            out.contains(
-                "vmm 0.10s (spawn 0.01 · load 0.04 · configure 0.01 · create 0.03 · teardown 0.01)"
+            out.starts_with(
+                "  early boot 0.17s · kernel boot 0.12s · vmm 0.07s (spawn 0.01 · load 0.04 · configure 0.01 · teardown 0.01)"
             ),
             "{out}"
         );

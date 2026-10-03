@@ -289,7 +289,7 @@ fn timings_and_trace_show_guest_phases() {
         "vmm",
         "(spawn ",
         "· load ",
-        "· create ",
+        "early boot",
         "· teardown ",
         "command",
         "commit",
