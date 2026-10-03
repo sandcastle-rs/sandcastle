@@ -224,15 +224,20 @@ fn debian_build_resolves_users_and_groups() {
     assert!(first.contains_key("etc/.wh.debian_version"));
 }
 
+/// Builds `dockerfile` with `ctx` as the context.
+fn build_dockerfile(ctx: &Path, dockerfile: &str, extra: &[&str]) -> Output {
+    let path = ctx.join("Dockerfile");
+    std::fs::write(&path, dockerfile).unwrap();
+    build_with(ctx, Some(&path), &ctx.join("out"), extra)
+}
+
 fn failing_build(body: &str) -> String {
     let ctx = tempfile::tempdir().unwrap();
-    let dockerfile = ctx.path().join("Dockerfile");
-    std::fs::write(
-        &dockerfile,
-        format!("FROM mirror.gcr.io/library/alpine:3.20\n{body}"),
-    )
-    .unwrap();
-    let output = build(ctx.path(), Some(&dockerfile), &ctx.path().join("out"));
+    let output = build_dockerfile(
+        ctx.path(),
+        &format!("FROM mirror.gcr.io/library/alpine:3.20\n{body}"),
+        &[],
+    );
     assert!(!output.status.success());
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -313,6 +318,57 @@ fn failing_chain_names_its_command() {
         "{stderr}"
     );
     assert!(stderr.contains("s into the step)"), "{stderr}");
-    // The printf's escape sequence is displayed escaped, never raw.
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn failing_command_with_an_escape_is_shown_escaped() {
+    // The shell traces `test` with the raw ESC from `$e` in its arguments.
+    let stderr = failing_build("RUN e=$(printf '\\033[2J') && test \"$e\" = x\n");
+    assert!(
+        stderr.contains("exited with 1; last command started: test "),
+        "{stderr}"
+    );
+    assert!(stderr.contains("\\x1b[2J"), "{stderr}");
     assert!(!stderr.contains('\u{1b}'), "raw escape in output");
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn bash_as_bin_sh_is_traced() {
+    let ctx = tempfile::tempdir().unwrap();
+    let output = build_dockerfile(
+        ctx.path(),
+        "FROM mirror.gcr.io/library/bash:5\n\
+         RUN ln -sf /usr/local/bin/bash /bin/sh\n\
+         RUN true && false && true\n",
+        &[],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exited with 1; last command started: false ("),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.lines().any(|l| l.trim_end() == "+ true"),
+        "trace lines leaked into the log"
+    );
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn nested_shell_traces_stay_in_the_log() {
+    let ctx = tempfile::tempdir().unwrap();
+    let output = build_dockerfile(
+        ctx.path(),
+        "FROM mirror.gcr.io/library/alpine:3.20\nRUN sh -c 'set -x; echo nested'\n",
+        &[],
+    );
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.lines().any(|l| l.trim_end() == "+ echo nested"),
+        "{stderr}"
+    );
 }

@@ -152,9 +152,17 @@ fn execute(root: &Path, job: &RunJob, rec: Option<&Recorder>) -> Result<i32> {
         && c == "-c"
     {
         let filter = MarkerFilter::new(&random_token()?);
-        spec.argv = vec!["/bin/sh".into(), "-x".into(), "-c".into(), cmd.clone()];
+        // PS4 is set in the script, not the environment: bash ignores an
+        // inherited PS4 when run as root, and an exported one would hide the
+        // trace lines of nested shells. One line, so the script's line
+        // numbers in shell errors are unchanged; the token is hex, so the
+        // quoting is safe.
+        spec.argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("PS4='{}'; set -x; {cmd}", filter.ps4()),
+        ];
         spec.env.retain(|e| !e.starts_with("PS4="));
-        spec.env.push(format!("PS4={}", filter.ps4()));
         command.arg(serde_json::to_string(&spec)?);
         return run_traced(command, filter, rec);
     }
