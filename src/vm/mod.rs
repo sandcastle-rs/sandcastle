@@ -204,10 +204,10 @@ pub fn outcome(child_exit: Option<i32>, status: Option<Status>) -> Result<Status
         ) => bail!("guest helper failed: {error}"),
         (Some(status), _) => Ok(status),
         (None, Some(code)) => bail!(
-            "VM or guest helper setup failed before the step ran (VM process exited with {code})"
+            "the VM or guest helper failed without reporting a status (see its output above; VM process exited with {code})"
         ),
         (None, None) => bail!(
-            "VM or guest helper setup failed before the step ran (VM process was killed by a signal)"
+            "the VM or guest helper failed without reporting a status (see its output above; VM process was killed by a signal)"
         ),
     }
 }
@@ -230,25 +230,25 @@ mod tests {
     }
 
     #[test]
-    fn missing_status_is_setup_failure_even_with_exit_127() {
+    fn missing_status_is_a_failure_even_with_exit_127() {
         let err = format!("{:#}", outcome(Some(127), None).unwrap_err());
-        assert!(err.contains("setup failed"), "{err}");
+        assert!(err.contains("without reporting a status"), "{err}");
         assert!(err.contains("127"), "{err}");
     }
 
     #[test]
-    fn unparseable_status_is_setup_failure() {
+    fn unparseable_status_is_a_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("status.json");
         fs::write(&path, b"{\"exit_co").unwrap();
         let status = read_status(&path).unwrap();
         assert!(status.is_none());
         let err = format!("{:#}", outcome(Some(0), status).unwrap_err());
-        assert!(err.contains("setup failed"), "{err}");
+        assert!(err.contains("without reporting a status"), "{err}");
     }
 
     #[test]
-    fn missing_status_after_signal_is_setup_failure() {
+    fn missing_status_after_signal_is_a_failure() {
         let err = format!("{:#}", outcome(None, None).unwrap_err());
         assert!(err.contains("killed by a signal"), "{err}");
     }
