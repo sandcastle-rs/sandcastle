@@ -31,7 +31,7 @@ type SetLogLevelFn = unsafe extern "C" fn(u32) -> i32;
 type SetVmConfigFn = unsafe extern "C" fn(u32, u8, u32) -> i32;
 type SetPathFn = unsafe extern "C" fn(u32, *const c_char) -> i32;
 type AddDiskFn = unsafe extern "C" fn(u32, *const c_char, *const c_char, bool) -> i32;
-type AddVirtiofsFn = unsafe extern "C" fn(u32, *const c_char, *const c_char) -> i32;
+type AddVirtiofsFn = unsafe extern "C" fn(u32, *const c_char, *const c_char, u64, bool) -> i32;
 type SetExecFn =
     unsafe extern "C" fn(u32, *const c_char, *const *const c_char, *const *const c_char) -> i32;
 type StartEnterFn = unsafe extern "C" fn(u32) -> i32;
@@ -70,7 +70,7 @@ impl Krun {
                 set_root: symbol(&lib, c"krun_set_root")?,
                 set_workdir: symbol(&lib, c"krun_set_workdir")?,
                 add_disk: symbol(&lib, c"krun_add_disk")?,
-                add_virtiofs: symbol(&lib, c"krun_add_virtiofs")?,
+                add_virtiofs: symbol(&lib, c"krun_add_virtiofs3")?,
                 set_exec: symbol(&lib, c"krun_set_exec")?,
                 start_enter: symbol(&lib, c"krun_start_enter")?,
                 _lib: lib,
@@ -152,13 +152,14 @@ impl Ctx<'_> {
         check(rc, "krun_add_disk").map(drop)
     }
 
-    pub fn add_virtiofs(&mut self, tag: &str, dir: &Path) -> Result<()> {
+    /// `shm_size` 0 keeps libkrun's default DAX window.
+    pub fn add_virtiofs(&mut self, tag: &str, dir: &Path, read_only: bool) -> Result<()> {
         let tag = CString::new(tag)?;
         let dir = path_cstring(dir)?;
         // SAFETY: both strings are NUL-terminated and outlive the call; libkrun copies them.
         check(
-            unsafe { (self.krun.add_virtiofs)(self.id, tag.as_ptr(), dir.as_ptr()) },
-            "krun_add_virtiofs",
+            unsafe { (self.krun.add_virtiofs)(self.id, tag.as_ptr(), dir.as_ptr(), 0, read_only) },
+            "krun_add_virtiofs3",
         )
         .map(drop)
     }

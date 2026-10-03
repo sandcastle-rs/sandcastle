@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use sandcastle::image::{self, ConfigState};
 use sandcastle::install::{self, Install};
 use sandcastle::store::Store;
+use sandcastle::vm::Resources;
 use sandcastle::{registry, vm};
 
 #[derive(Parser)]
@@ -39,6 +40,26 @@ enum Command {
         #[arg(long)]
         tag: Option<String>,
     },
+    /// Build a Dockerfile into an OCI image layout directory.
+    Build {
+        /// Build context directory.
+        context: PathBuf,
+        /// Dockerfile path [default: <context>/Dockerfile].
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
+        /// Name recorded in the layout index (use as `oci:<output>:<tag>`).
+        #[arg(short, long)]
+        tag: String,
+        /// Output OCI layout directory (created or updated in place).
+        #[arg(short, long)]
+        output: PathBuf,
+        /// vCPUs per build-step VM [default: all host CPUs].
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..))]
+        cpus: Option<u8>,
+        /// Memory per build-step VM, in MiB.
+        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..))]
+        memory: u32,
+    },
     /// Internal: configure and enter a microVM for one job.
     #[command(name = "__vm", hide = true)]
     Vm { job_dir: PathBuf },
@@ -52,6 +73,14 @@ fn main() -> ExitCode {
             output,
             tag,
         } => pull(&reference, &output, tag),
+        Command::Build {
+            context,
+            file,
+            tag,
+            output,
+            cpus,
+            memory,
+        } => build(context, file, tag, output, cpus, memory),
         Command::Vm { job_dir } => Err(vm::child::enter(&job_dir)),
     };
     match result {
@@ -88,5 +117,36 @@ fn pull(reference: &str, output: &Path, tag: Option<String>) -> anyhow::Result<(
     };
     let manifest = image::write_layout(&blobs, &state, output, &tag)?;
     println!("{} {}:{tag}", manifest.digest(), output.display());
+    Ok(())
+}
+
+fn build(
+    context: PathBuf,
+    file: Option<PathBuf>,
+    tag: String,
+    output: PathBuf,
+    cpus: Option<u8>,
+    memory: u32,
+) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut resources = Resources::default();
+    if let Some(cpus) = cpus {
+        resources.vcpus = cpus;
+    }
+    resources.ram_mib = memory;
+    let opts = sandcastle::build::Options {
+        dockerfile: file.unwrap_or_else(|| context.join("Dockerfile")),
+        context,
+        output,
+        tag,
+        resources,
+    };
+    let manifest = sandcastle::build::build(&exe, &opts)?;
+    println!(
+        "{} {}:{}",
+        manifest.digest(),
+        opts.output.display(),
+        opts.tag
+    );
     Ok(())
 }
