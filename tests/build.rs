@@ -19,6 +19,10 @@ fn fixture(name: &str) -> PathBuf {
 /// Runs `sandcastle build` with a store shared by all build tests, so base
 /// images are pulled once per `just it` run.
 fn build(context: &Path, dockerfile: Option<&Path>, out: &Path) -> Output {
+    build_with(context, dockerfile, out, &[])
+}
+
+fn build_with(context: &Path, dockerfile: Option<&Path>, out: &Path, extra: &[&str]) -> Output {
     let bin = PathBuf::from(std::env::var_os("SANDCASTLE_BIN").expect("SANDCASTLE_BIN"));
     let store = bin.parent().unwrap().join("store");
     let mut cmd = Command::new(&bin);
@@ -27,6 +31,7 @@ fn build(context: &Path, dockerfile: Option<&Path>, out: &Path) -> Output {
         cmd.arg("-f").arg(f);
     }
     let output = cmd
+        .args(extra)
         .arg(context)
         .env("SANDCASTLE_ROOT", store)
         .output()
@@ -219,15 +224,20 @@ fn debian_build_resolves_users_and_groups() {
     assert!(first.contains_key("etc/.wh.debian_version"));
 }
 
+/// Builds `dockerfile` with `ctx` as the context.
+fn build_dockerfile(ctx: &Path, dockerfile: &str, extra: &[&str]) -> Output {
+    let path = ctx.join("Dockerfile");
+    std::fs::write(&path, dockerfile).unwrap();
+    build_with(ctx, Some(&path), &ctx.join("out"), extra)
+}
+
 fn failing_build(body: &str) -> String {
     let ctx = tempfile::tempdir().unwrap();
-    let dockerfile = ctx.path().join("Dockerfile");
-    std::fs::write(
-        &dockerfile,
-        format!("FROM mirror.gcr.io/library/alpine:3.20\n{body}"),
-    )
-    .unwrap();
-    let output = build(ctx.path(), Some(&dockerfile), &ctx.path().join("out"));
+    let output = build_dockerfile(
+        ctx.path(),
+        &format!("FROM mirror.gcr.io/library/alpine:3.20\n{body}"),
+        &[],
+    );
     assert!(!output.status.success());
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -252,4 +262,150 @@ fn unknown_user_fails_step() {
         stderr.contains("unable to find user nosuchuser"),
         "{stderr}"
     );
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn timings_and_trace_show_guest_phases() {
+    let ctx = tempfile::tempdir().unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    std::fs::write(
+        &dockerfile,
+        "FROM mirror.gcr.io/library/alpine:3.20\nRUN echo one >/one && echo two\n",
+    )
+    .unwrap();
+    let trace = ctx.path().join("trace.json");
+    let output = build_with(
+        ctx.path(),
+        Some(&dockerfile),
+        &ctx.path().join("out"),
+        &["--timings", "--trace", trace.to_str().unwrap()],
+    );
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[2/2] done in "), "{stderr}");
+    for phase in ["kernel boot", "vmm", "command", "commit", "ingest"] {
+        assert!(stderr.contains(phase), "{phase} missing: {stderr}");
+    }
+    assert!(stderr.contains("Steps by duration:"), "{stderr}");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&trace).unwrap()).unwrap();
+    let names: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect();
+    for n in [
+        "build",
+        "pull",
+        "vm",
+        "kernel boot",
+        "command",
+        "cmd: echo two",
+        "ingest",
+        "write layout",
+    ] {
+        assert!(names.iter().any(|x| x == n), "{n} missing: {names:?}");
+    }
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn failing_chain_names_its_command() {
+    let stderr = failing_build("RUN true && printf '\\033[2J' >/dev/null && false && true\n");
+    assert!(
+        stderr.contains("exited with 1; last command started: false ("),
+        "{stderr}"
+    );
+    assert!(stderr.contains("s into the step)"), "{stderr}");
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn failing_command_with_an_escape_is_shown_escaped() {
+    // The shell traces `test` with the raw ESC from `$e` in its arguments.
+    let stderr = failing_build("RUN e=$(printf '\\033[2J') && test \"$e\" = x\n");
+    assert!(
+        stderr.contains("exited with 1; last command started: test "),
+        "{stderr}"
+    );
+    assert!(stderr.contains("\\x1b[2J"), "{stderr}");
+    assert!(!stderr.contains('\u{1b}'), "raw escape in output");
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn bash_as_bin_sh_is_traced() {
+    let ctx = tempfile::tempdir().unwrap();
+    let output = build_dockerfile(
+        ctx.path(),
+        "FROM mirror.gcr.io/library/bash:5\n\
+         RUN ln -sf /usr/local/bin/bash /bin/sh\n\
+         RUN true && false && true\n",
+        &[],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exited with 1; last command started: false ("),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.lines().any(|l| l.trim_end() == "+ true"),
+        "trace lines leaked into the log"
+    );
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn nested_shell_traces_stay_in_the_log() {
+    let ctx = tempfile::tempdir().unwrap();
+    let output = build_dockerfile(
+        ctx.path(),
+        "FROM mirror.gcr.io/library/alpine:3.20\nRUN sh -c 'set -x; echo nested'\n",
+        &[],
+    );
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.lines().any(|l| l.trim_end() == "+ echo nested"),
+        "{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn failed_build_still_reports_timings_and_trace() {
+    let ctx = tempfile::tempdir().unwrap();
+    let trace = ctx.path().join("trace.json");
+    let output = build_dockerfile(
+        ctx.path(),
+        "FROM mirror.gcr.io/library/alpine:3.20\nRUN true\nRUN true && false\n",
+        &["--timings", "--trace", trace.to_str().unwrap()],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let summary = stderr
+        .split("Steps by duration:")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no summary: {stderr}"));
+    for step in [
+        "s  step 1/3 FROM ",
+        "s  step 2/3 RUN true",
+        "s  step 3/3 RUN true && false",
+    ] {
+        assert!(summary.contains(step), "{step} missing: {stderr}");
+    }
+    let failing = stderr.split("[3/3] RUN true && false").nth(1).unwrap();
+    assert!(failing.contains("· command "), "{stderr}");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&trace).unwrap()).unwrap();
+    let names: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    for n in ["command", "cmd: false"] {
+        assert!(names.contains(&n), "{n} missing: {names:?}");
+    }
 }

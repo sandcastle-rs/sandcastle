@@ -12,6 +12,8 @@ use rustix::fs::syncfs;
 use rustix::mount::{MountFlags, UnmountFlags, mount, unmount};
 use sandcastle_proto::{LowerLayer, SHARE_BLOBS};
 
+use crate::events::Recorder;
+use crate::linux::phase;
 use crate::{layer, unpack};
 
 /// First virtio-blk device: the store disk added by the host.
@@ -67,7 +69,7 @@ impl Store {
     }
 
     /// Unpacks every layer of `lower` that is not in the store yet.
-    pub fn ensure_layers(&self, lower: &[LowerLayer]) -> Result<()> {
+    pub fn ensure_layers(&self, lower: &[LowerLayer], rec: Option<&Recorder>) -> Result<()> {
         let mut blobs_mounted = false;
         for l in lower {
             let dest = self.layer_dir(&l.diff_id)?;
@@ -91,11 +93,14 @@ impl Store {
             let tmp = self
                 .work
                 .join(format!("unpack-{}", layer::digest_hex(&l.diff_id)?));
-            unpack::unpack(&blob, &l.media_type, &l.diff_id, &tmp)
-                .with_context(|| format!("unpacking layer {}", l.diff_id))?;
+            let detail = &l.diff_id[..l.diff_id.len().min(19)];
+            phase(rec, "unpack", Some(detail), || {
+                unpack::unpack(&blob, &l.media_type, &l.diff_id, &tmp)
+            })
+            .with_context(|| format!("unpacking layer {}", l.diff_id))?;
             // The directory's presence marks the layer complete, so its
             // contents must be on disk before it appears.
-            self.sync()?;
+            phase(rec, "sync", None, || self.sync())?;
             fs::rename(&tmp, &dest)?;
         }
         Ok(())

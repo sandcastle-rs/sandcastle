@@ -9,7 +9,7 @@ use sandcastle::install::Install;
 use sandcastle::registry;
 use sandcastle::store::Store;
 use sandcastle::vm::{Resources, Vm};
-use sandcastle_proto::{CopyJob, Job, LAYER_FILE, LowerLayer, RunJob, Status};
+use sandcastle_proto::{CopyJob, EVENTS_FILE, Event, Job, LAYER_FILE, LowerLayer, RunJob, Status};
 
 fn sandcastle_bin() -> PathBuf {
     std::env::var_os("SANDCASTLE_BIN")
@@ -224,6 +224,7 @@ fn run_job(lower: Vec<LowerLayer>, script: &str, user: &str) -> Job {
         user: user.into(),
         workdir: "/work".into(),
         resolv_conf: "nameserver 8.8.8.8\n".into(),
+        shell_form: false,
     })
 }
 
@@ -504,4 +505,142 @@ fn run_cannot_reach_the_store_disk() {
         "the store is still mounted in the step"
     );
     assert_eq!(entries["m5"].2, b"blocked\n");
+}
+
+fn shell_job(lower: Vec<LowerLayer>, script: &str) -> Job {
+    let Job::Run(mut run) = run_job(lower, script, "") else {
+        unreachable!()
+    };
+    run.shell_form = true;
+    Job::Run(run)
+}
+
+fn events(out_dir: &std::path::Path) -> Vec<Event> {
+    std::fs::read_to_string(out_dir.join(EVENTS_FILE))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn cmds(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Cmd { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn traced_chain_reports_the_failing_command_last() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let finished = vm
+        .run(
+            &shell_job(
+                busybox(&store),
+                "printf 'a\\rb\\n' >&2 && true && false && true",
+            ),
+            None,
+        )
+        .unwrap();
+    assert_eq!(finished.status.exit_code, 1);
+    let ev = events(&finished.out_dir());
+    assert_eq!(cmds(&ev).last().map(String::as_str), Some("false"));
+    let phases: Vec<&str> = ev
+        .iter()
+        .filter_map(|e| match e {
+            Event::Phase { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    for p in ["store mount", "overlay", "command", "unmount"] {
+        assert!(phases.contains(&p), "{p} missing from {phases:?}");
+    }
+    assert!(matches!(ev.first(), Some(Event::Boot { .. })));
+    assert!(matches!(ev.last(), Some(Event::End { .. })));
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn forged_markers_and_set_plus_x() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let job = shell_job(
+        busybox(&store),
+        "echo '+sc-000000000000> forged' >&2 && true && set +x && false",
+    );
+    let finished = vm.run(&job, None).unwrap();
+    let c = cmds(&events(&finished.out_dir()));
+    assert!(
+        !c.iter()
+            .any(|t| t.contains("forged") && !t.starts_with("echo")),
+        "{c:?}"
+    );
+    assert_eq!(c.last().map(String::as_str), Some("set +x"));
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn exec_form_and_copy_jobs_still_record_phases() {
+    let (dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let finished = vm.run(&run_job(busybox(&store), "true", ""), None).unwrap();
+    assert!(
+        cmds(&events(&finished.out_dir())).is_empty(),
+        "exec-style job is not traced"
+    );
+    let ctx = dir.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(ctx.join("a"), "a").unwrap();
+    let copy = Job::Copy(CopyJob {
+        lower: busybox(&store),
+        sources: vec!["a".into()],
+        dest: "/a".into(),
+        workdir: "/".into(),
+    });
+    let finished = vm.run(&copy, Some(&ctx)).unwrap();
+    let ev = events(&finished.out_dir());
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, Event::Phase { name, .. } if name == "copy"))
+    );
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, Event::Phase { name, .. } if name == "commit"))
+    );
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn traced_run_finishes_with_a_leftover_background_process() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let job = shell_job(busybox(&store), "sleep 1000 & echo started > /started");
+    let finished = vm.run(&job, None).unwrap();
+    assert_eq!(finished.status.exit_code, 0);
+    assert!(finished.status.layer.is_some());
 }

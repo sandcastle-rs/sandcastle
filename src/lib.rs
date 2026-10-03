@@ -8,4 +8,5 @@ pub mod image;
 pub mod install;
 pub mod registry;
 pub mod store;
+pub mod trace;
 pub mod vm;

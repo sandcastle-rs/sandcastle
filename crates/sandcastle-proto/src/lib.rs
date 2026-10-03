@@ -9,6 +9,15 @@ use serde::{Deserialize, Serialize};
 pub const JOB_FILE: &str = "job.json";
 /// Status file name inside the guest's `/out` share.
 pub const STATUS_FILE: &str = "status.json";
+/// Append-only JSON lines the guest writes to `/out` for observability.
+pub const EVENTS_FILE: &str = "events.jsonl";
+/// Most traced shell commands kept per step; the rest are counted only.
+pub const MAX_CMD_EVENTS: usize = 10_000;
+/// Longest traced command text kept, in bytes.
+pub const MAX_CMD_TEXT: usize = 1024;
+/// Largest events file the host reads; the guest keeps below it.
+pub const MAX_EVENTS_BYTES: u64 = 8 << 20;
+
 /// Uncompressed layer tar a `run` or `copy` job leaves in `/out`.
 pub const LAYER_FILE: &str = "layer.tar";
 /// Path of the guest helper inside the VM.
@@ -44,6 +53,30 @@ pub struct LowerLayer {
     pub media_type: String,
 }
 
+/// One line of `events.jsonl`. Times are microseconds since the guest
+/// helper started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    /// `CLOCK_BOOTTIME` when the helper started: guest kernel boot time.
+    Boot { kernel_boot_us: u64 },
+    Phase {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        start_us: u64,
+        dur_us: u64,
+    },
+    /// A shell command the traced shell (`set -x`) started.
+    Cmd { text: String, start_us: u64 },
+    Limits {
+        cmd_events_dropped: u64,
+        truncated: u64,
+    },
+    /// Written just before `status.json`; anchors the timeline on the host.
+    End { at_us: u64 },
+}
+
 /// A `RUN` step. `lower` is bottom first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunJob {
@@ -55,6 +88,10 @@ pub struct RunJob {
     pub workdir: String,
     /// Contents of the step's `/etc/resolv.conf`.
     pub resolv_conf: String,
+    /// `argv` is `["/bin/sh", "-c", cmd]` from a shell-form RUN; the guest
+    /// traces it with `set -x` to report the last command started.
+    #[serde(default)]
+    pub shell_form: bool,
 }
 
 /// A `COPY` step from the build context (shared at `/ctx`). `lower` is bottom first.
@@ -166,5 +203,58 @@ mod tests {
             .unwrap(),
             r#"{"exit_code":3}"#
         );
+    }
+
+    #[test]
+    fn event_wire_format() {
+        let lines = [
+            r#"{"type":"boot","kernel_boot_us":91000}"#,
+            r#"{"type":"phase","name":"unpack","detail":"sha256:1a2b3c4d5e6f","start_us":1200,"dur_us":840000}"#,
+            r#"{"type":"cmd","text":"apt-get install -y foo","start_us":2100000}"#,
+            r#"{"type":"limits","cmd_events_dropped":3,"truncated":1}"#,
+            r#"{"type":"end","at_us":4180000}"#,
+        ];
+        let events: Vec<Event> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            events[0],
+            Event::Boot {
+                kernel_boot_us: 91000
+            }
+        );
+        assert_eq!(
+            events[1],
+            Event::Phase {
+                name: "unpack".into(),
+                detail: Some("sha256:1a2b3c4d5e6f".into()),
+                start_us: 1200,
+                dur_us: 840000
+            }
+        );
+        assert_eq!(events[4], Event::End { at_us: 4180000 });
+        // Round trip keeps the exact wire shape.
+        assert_eq!(serde_json::to_string(&events[2]).unwrap(), lines[2]);
+        let no_detail = Event::Phase {
+            name: "commit".into(),
+            detail: None,
+            start_us: 1,
+            dur_us: 2,
+        };
+        assert_eq!(
+            serde_json::to_string(&no_detail).unwrap(),
+            r#"{"type":"phase","name":"commit","start_us":1,"dur_us":2}"#
+        );
+    }
+
+    #[test]
+    fn run_job_shell_form_defaults_to_false() {
+        let job: Job = serde_json::from_str(
+            r#"{"mode":"run","lower":[],"argv":["true"],"env":[],"user":"","workdir":"/","resolv_conf":""}"#,
+        )
+        .unwrap();
+        let Job::Run(run) = job else { panic!() };
+        assert!(!run.shell_form);
     }
 }

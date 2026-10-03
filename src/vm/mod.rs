@@ -14,6 +14,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use sandcastle_proto::{JOB_FILE, Job, SHARE_BLOBS, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status};
@@ -84,6 +85,8 @@ impl Vm<'_> {
         let mut finished = Finished {
             status: Status::default(),
             dir: self.store.new_job_dir()?,
+            started: Instant::now(),
+            ended: Instant::now(),
         };
         let out_dir = finished.out_dir();
         fs::write(out_dir.join(JOB_FILE), serde_json::to_vec(job)?)?;
@@ -117,6 +120,7 @@ impl Vm<'_> {
         fs::write(finished.dir.join(SPEC_FILE), serde_json::to_vec(&spec)?)?;
 
         // libkrun dlopens libkrunfw by bare file name; point the loader at the bundle.
+        finished.started = Instant::now();
         let exit = Command::new(self.exe)
             .arg("__vm")
             .arg(&finished.dir)
@@ -124,6 +128,7 @@ impl Vm<'_> {
             .env(PARENT_PID_ENV, std::process::id().to_string())
             .status()
             .with_context(|| format!("starting {}", self.exe.display()))?;
+        finished.ended = Instant::now();
         let status = read_status(&out_dir.join(STATUS_FILE))?;
         finished.status = outcome(exit.code(), status)?;
         Ok(finished)
@@ -134,6 +139,9 @@ impl Vm<'_> {
 /// `out`, is removed when this is dropped.
 pub struct Finished {
     pub status: Status,
+    /// When the VM process was spawned and when it exited.
+    pub started: Instant,
+    pub ended: Instant,
     dir: PathBuf,
 }
 

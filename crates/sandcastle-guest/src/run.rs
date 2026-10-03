@@ -3,7 +3,7 @@
 
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Stdio};
@@ -24,9 +24,11 @@ use sandcastle_proto::{GUEST_HELPER_PATH, RunJob, Status};
 use serde::{Deserialize, Serialize};
 
 use crate::copy::resolve_in_root;
-use crate::linux::commit_upper;
+use crate::events::Recorder;
+use crate::linux::{commit_upper, phase};
 use crate::overlay::Overlay;
 use crate::store::Store;
+use crate::trace_filter::MarkerFilter;
 use crate::user;
 
 /// Argument that makes the helper act as the step's exec child.
@@ -68,14 +70,14 @@ struct ExecSpec {
     groups: Vec<u32>,
 }
 
-pub fn run_job(store: &Store, job: &RunJob, out: &Path) -> Result<Status> {
-    store.ensure_layers(&job.lower)?;
+pub fn run_job(store: &Store, job: &RunJob, out: &Path, rec: Option<&Recorder>) -> Result<Status> {
+    store.ensure_layers(&job.lower, rec)?;
     let work = store.work("run")?;
     let mut lowers = store.lower_dirs(&job.lower)?;
     lowers.push(stub_layer(&work)?);
     write_etc(&job.resolv_conf)?;
-    let overlay = Overlay::mount(&lowers, &work)?;
-    let result = execute(overlay.merged(), job);
+    let overlay = phase(rec, "overlay", None, || Overlay::mount(&lowers, &work))?;
+    let result = phase(rec, "command", None, || execute(overlay.merged(), job, rec));
     let upper = overlay.unmount()?;
     let exit_code = result?;
     if exit_code != 0 {
@@ -85,7 +87,7 @@ pub fn run_job(store: &Store, job: &RunJob, out: &Path) -> Result<Status> {
             ..Default::default()
         });
     }
-    commit_upper(store, &upper, out)
+    commit_upper(store, &upper, out, rec)
 }
 
 /// Bottom-most lower layer providing mount points, so binds never create
@@ -119,7 +121,7 @@ fn write_etc(resolv_conf: &str) -> Result<()> {
     Ok(())
 }
 
-fn execute(root: &Path, job: &RunJob) -> Result<i32> {
+fn execute(root: &Path, job: &RunJob, rec: Option<&Recorder>) -> Result<i32> {
     let passwd = read_in_root(root, "/etc/passwd")?;
     let group = read_in_root(root, "/etc/group")?;
     let ids = user::resolve(&job.user, &passwd, &group)?;
@@ -127,7 +129,7 @@ fn execute(root: &Path, job: &RunJob) -> Result<i32> {
     if !env.iter().any(|e| e.starts_with("HOME=")) {
         env.push(format!("HOME={}", ids.home));
     }
-    let spec = ExecSpec {
+    let mut spec = ExecSpec {
         root: root.to_path_buf(),
         argv: job.argv.clone(),
         env,
@@ -143,13 +145,83 @@ fn execute(root: &Path, job: &RunJob) -> Result<i32> {
         .context("creating the step's PID namespace")?;
     // The child is init of that namespace: when the command exits the kernel
     // kills whatever it left running, so the overlay can be unmounted.
-    let status = Command::new(GUEST_HELPER_PATH)
-        .arg(EXEC_ARG)
+    let mut command = Command::new(GUEST_HELPER_PATH);
+    command.arg(EXEC_ARG).stdin(Stdio::null());
+    if let (true, Some(rec), [sh, c, cmd]) = (job.shell_form, rec, job.argv.as_slice())
+        && sh == "/bin/sh"
+        && c == "-c"
+    {
+        let filter = MarkerFilter::new(&random_token()?);
+        // PS4 is set in the script, not the environment: bash ignores an
+        // inherited PS4 when run as root, and an exported one would hide the
+        // trace lines of nested shells. One line, so the script's line
+        // numbers in shell errors are unchanged; the token is hex, so the
+        // quoting is safe.
+        spec.argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("PS4='{}'; set -x; {cmd}", filter.ps4()),
+        ];
+        spec.env.retain(|e| !e.starts_with("PS4="));
+        command.arg(serde_json::to_string(&spec)?);
+        return run_traced(command, filter, rec);
+    }
+    let status = command
         .arg(serde_json::to_string(&spec)?)
-        .stdin(Stdio::null())
         .status()
         .context("starting the step")?;
     Ok(exit_code(status))
+}
+
+/// 12 lowercase hex characters the step cannot guess.
+fn random_token() -> Result<String> {
+    let mut bytes = [0u8; 6];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("reading /dev/urandom")?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Runs the exec child with its stderr piped through `filter`: trace lines
+/// become `cmd` events, everything else goes on to the VM's stderr. EOF comes
+/// once every holder of the pipe has exited; the command is init of its PID
+/// namespace, so leftover background processes die with it.
+fn run_traced(mut command: Command, mut filter: MarkerFilter, rec: &Recorder) -> Result<i32> {
+    let mut child = command
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting the step")?;
+    let mut stderr = child.stderr.take().context("capturing the step's stderr")?;
+    let mut buf = vec![0u8; 64 << 10];
+    let mut out = Vec::new();
+    let mut cmds = Vec::new();
+    loop {
+        let n = match stderr.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e).context("reading the step's stderr");
+            }
+        };
+        filter.feed(&buf[..n], &mut out, &mut cmds);
+        forward(&mut out, &mut cmds, rec);
+    }
+    filter.finish(&mut out, &mut cmds);
+    forward(&mut out, &mut cmds, rec);
+    rec.add_truncated(filter.truncated());
+    let status = child.wait().context("waiting for the step")?;
+    Ok(exit_code(status))
+}
+
+fn forward(out: &mut Vec<u8>, cmds: &mut Vec<String>, rec: &Recorder) {
+    let _ = io::stderr().write_all(out);
+    out.clear();
+    for text in cmds.drain(..) {
+        rec.cmd(&text, rec.now_us());
+    }
 }
 
 fn exit_code(status: ExitStatus) -> i32 {
