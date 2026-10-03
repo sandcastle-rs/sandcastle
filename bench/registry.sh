@@ -7,7 +7,7 @@ source "$(dirname "$0")/lib.sh"
 case "${1:-}" in
 start)
     if ! $ENGINE container inspect "$REGISTRY_NAME" >/dev/null 2>&1; then
-        $ENGINE run -d --name "$REGISTRY_NAME" -p "$REGISTRY_PORT:5000" "$REGISTRY_IMAGE" >/dev/null
+        $ENGINE run -d --name "$REGISTRY_NAME" -p "127.0.0.1:$REGISTRY_PORT:5000" "$REGISTRY_IMAGE" >/dev/null
     fi
     $ENGINE start "$REGISTRY_NAME" >/dev/null
     for _ in $(seq 1 30); do

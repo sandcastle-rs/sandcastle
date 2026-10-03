@@ -73,7 +73,11 @@ pub fn protocol_for(registry: &str) -> ClientProtocol {
         Some(rest) => rest.split(']').next().unwrap_or(rest),
         None => registry.split(':').next().unwrap_or(registry),
     };
-    if host == "localhost" || host == "::1" || host.starts_with("127.") {
+    let loopback = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if loopback {
         ClientProtocol::HttpsExcept(vec![registry.to_string()])
     } else {
         ClientProtocol::Https
@@ -335,6 +339,7 @@ mod tests {
         for host in [
             "mirror.gcr.io",
             "localhost.example.com:5000",
+            "127.example.com:5000",
             "10.0.0.5:5000",
             "registry-1.docker.io",
         ] {

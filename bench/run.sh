@@ -39,6 +39,7 @@ done
 
 sandcastle="$REPO_DIR/target/release/sandcastle"
 [[ -x "$sandcastle" ]] || { echo "run \`just build\` first" >&2; exit 1; }
+[[ -d "$REPO_DIR/lib" ]] || { echo "lib/ is missing; run \`just build-libs\` or \`just fetch-libs\`" >&2; exit 1; }
 export SANDCASTLE_LIBKRUN_DIR="$REPO_DIR/lib"
 work="$(mktemp -d "${TMPDIR:-/tmp}/sandcastle-bench.XXXXXX")"
 trap 'rm -rf "$work"; "$BENCH_DIR/buildkit.sh" stop' EXIT
@@ -47,18 +48,30 @@ results="$BENCH_DIR/results/$stamp"
 mkdir -p "$results"
 
 "$BENCH_DIR/registry.sh" start
-curl -fsS "http://localhost:$REGISTRY_PORT/v2/library/alpine/tags/list" >/dev/null 2>&1 ||
-    { echo "registry has no benchmark images; run bench/registry.sh seed" >&2; exit 1; }
+while read -r _ dst; do
+    [[ -z "$dst" ]] && continue
+    curl -fsS "http://localhost:$REGISTRY_PORT/v2/${dst%%:*}/tags/list" >/dev/null 2>&1 ||
+        { echo "registry is missing ${dst%%:*}; run bench/registry.sh seed" >&2; exit 1; }
+done <"$BENCH_DIR/images.txt"
 "$BENCH_DIR/gen-context.sh"
 
+if [[ "$(uname -s)" == Darwin ]]; then
+    host_cpus="$(sysctl -n hw.ncpu)"
+    engine_vm="$(podman machine inspect --format '{{.Resources.CPUs}} CPU / {{.Resources.Memory}} MiB' 2>/dev/null || echo unknown)"
+else
+    host_cpus="$(nproc)"
+    engine_vm="native (host: $host_cpus CPU)"
+fi
 {
     echo "# Benchmark environment"
     echo
     echo "- date: $(date -u +%Y-%m-%dT%H:%MZ)"
     echo "- host: $(uname -srm)"
     echo "- cpu: $(if [[ "$(uname -s)" == Darwin ]]; then sysctl -n machdep.cpu.brand_string; else grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-; fi)"
-    echo "- sandcastle: $(git -C "$REPO_DIR" rev-parse --short HEAD)"
-    echo "- buildkit: $BUILDKIT_IMAGE via $ENGINE"
+    echo "- sandcastle: $(git -C "$REPO_DIR" describe --always --dirty)"
+    echo "- sandcastle per-step VM: $host_cpus CPU / 2048 MiB"
+    echo "- buildkit: $BUILDKIT_IMAGE via $ENGINE ($($ENGINE --version))"
+    echo "- buildkit engine VM: $engine_vm"
     echo "- hyperfine: $(hyperfine --version)"
     echo "- runs: $runs; modes: $modes; tools: $tools"
 } >"$results/environment.md"

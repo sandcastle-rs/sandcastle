@@ -2,6 +2,7 @@
 # Generates the build context for the large-copy case (deterministic bytes).
 set -euo pipefail
 dest="$(cd "$(dirname "$0")" && pwd)/cases/large-copy/data"
+rm -rf "$dest".tmp.*
 if [[ -d "$dest" && "${1:-}" != "--force" ]]; then
     echo "large-copy context exists: $dest (use --force to regenerate)"
     exit 0

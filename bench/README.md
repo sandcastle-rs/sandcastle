@@ -23,8 +23,10 @@ The package cases download from the internet in every run, so they include netwo
 
 ## macOS setup
 
+0. Prerequisites: Rust via rustup plus `rustup target add aarch64-unknown-linux-musl`; `just`; `podman`; and `lib/`, from either `just fetch-libs` or `just build-libs` (after `brew install lld xz e2fsprogs zstd`). `bench/run.sh` fails early if `lib/` is missing.
 1. `brew install hyperfine buildkit skopeo` (python3 3.9 or newer is also needed, for `gen-context.sh`)
-2. Start a podman machine: `podman machine start`. For the rootful BuildKit mode the machine must be rootful (`podman machine set --rootful`, while stopped). If rootful BuildKit does not run there, use `--tools sandcastle,buildkit-rootless`. Rootless BuildKit inside the macOS podman machine was tried and fails at the first `RUN` (`error mounting "devpts" ... permission denied`), so on macOS use rootful.
+2. Start a podman machine: `podman machine start`. For the rootful BuildKit mode the machine must be rootful (`podman machine set --rootful`, while stopped). Rootless BuildKit inside the macOS podman machine was tried and fails at the first `RUN` (`error mounting "devpts" ... permission denied`), so on macOS use rootful.
+   sandcastle gives each step VM all host CPUs and 2048 MiB, while BuildKit is capped by the podman machine. Size the machine to the host CPU count (`podman machine stop; podman machine set --cpus "$(sysctl -n hw.ncpu)"; podman machine start`), or treat the numbers as not CPU-matched. `environment.md` records both budgets.
 3. `bench/registry.sh start && bench/registry.sh seed`
 4. `just bench` (runs `just build` first). Arguments are passed through, for example `just bench --cases many-runs --runs 3`.
 
@@ -46,6 +48,10 @@ just bench --tools sandcastle,buildkit,buildkit-rootless
 ## Troubleshooting
 
 `bench/lib.sh` sets `REGISTRY_AUTH_FILE` to `bench/auth.json` (empty) so a broken credential helper in your own container auth config cannot fail the anonymous pulls. Set the variable yourself to override.
+
+If `registry.sh start` reports that the registry did not come up (for example, an old container publishing another port), run `bench/registry.sh stop` and then `start`.
+
+On Ubuntu 24.04, rootless BuildKit fails because of `kernel.apparmor_restrict_unprivileged_userns=1`. To allow it on the benchmark box, run `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` and persist it with `echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-bench-userns.conf`. This relaxes a security default; `setup-ubuntu.sh` does not do it for you.
 
 ## Reading results
 

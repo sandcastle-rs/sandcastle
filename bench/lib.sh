@@ -2,6 +2,8 @@
 # Shared benchmark settings. Sourced, not executed.
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$BENCH_DIR/.." && pwd)"
+# The port also appears in bench/buildkitd.toml and in the FROM line of every
+# bench/cases/*/Dockerfile (v1 Dockerfiles have no ARG before FROM); change all together.
 REGISTRY_PORT=5001
 REGISTRY_NAME=sandcastle-bench-registry
 REGISTRY_IMAGE=docker.io/library/registry:2

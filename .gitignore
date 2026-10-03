@@ -2,3 +2,4 @@
 /lib
 /bench/results/*/
 /bench/cases/large-copy/data/
+/bench/cases/large-copy/data.tmp.*/
