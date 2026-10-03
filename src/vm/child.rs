@@ -17,6 +17,16 @@ pub fn enter(job_dir: &Path) -> anyhow::Error {
         Ok(never) => match never {},
         Err(e) => e,
     }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn x86_guests_skip_the_tsc_sync_check() {
+        assert!(
+            guest_env(false, None)
+                .unwrap()
+                .contains(&"tsc=reliable".to_string())
+        );
+    }
 }
 
 fn try_enter(job_dir: &Path) -> Result<Infallible> {
@@ -60,11 +70,23 @@ fn try_enter(job_dir: &Path) -> Result<Infallible> {
     Err(ctx.start_enter())
 }
 
+/// Guest kernel boot parameters sandcastle always passes.
+///
+/// `tsc=reliable` skips x86's TSC synchronization test, which otherwise runs
+/// for ~20 ms per secondary CPU while the guest boots (the bench box spent
+/// ~120 ms of every 8-vCPU step in it). KVM gives all vCPUs the host's
+/// synchronized TSC, and a build-step VM lives for well under a second.
+#[cfg(target_arch = "x86_64")]
+const KERNEL_ARGS: &[&str] = &["tsc=reliable"];
+#[cfg(not(target_arch = "x86_64"))]
+const KERNEL_ARGS: &[&str] = &[];
+
 /// The guest helper's environment. libkrun writes each entry, in double
 /// quotes, onto the guest kernel's command line; the kernel takes the ones
 /// it knows as boot parameters, which is how `kernel_args` reach it.
 fn guest_env(kmsg: bool, kernel_args: Option<&str>) -> Result<Vec<String>> {
     let mut env = vec!["HOME=/".to_string()];
+    env.extend(KERNEL_ARGS.iter().map(|a| a.to_string()));
     if kmsg {
         env.push(format!("{KMSG_ENV}=1"));
     }
@@ -98,6 +120,16 @@ fn raise_fd_limit() {
             eprintln!("sandcastle: warning: could not raise the open file limit: {e}");
         }
     }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn x86_guests_skip_the_tsc_sync_check() {
+        assert!(
+            guest_env(false, None)
+                .unwrap()
+                .contains(&"tsc=reliable".to_string())
+        );
+    }
 }
 
 /// The VM keeps the store disk open, so it must not outlive the build that
@@ -122,13 +154,26 @@ mod tests {
 
     #[test]
     fn guest_env_carries_debug_flags_and_kernel_args() {
-        assert_eq!(guest_env(false, None).unwrap(), ["HOME=/"]);
-        assert_eq!(
-            guest_env(true, Some("tsc=reliable  loglevel=7")).unwrap(),
-            ["HOME=/", "SANDCASTLE_KMSG=1", "tsc=reliable", "loglevel=7"]
-        );
+        let base: Vec<&str> = ["HOME=/"]
+            .into_iter()
+            .chain(KERNEL_ARGS.iter().copied())
+            .collect();
+        assert_eq!(guest_env(false, None).unwrap(), base);
+        let mut debug = base.clone();
+        debug.extend(["SANDCASTLE_KMSG=1", "nosmt", "loglevel=7"]);
+        assert_eq!(guest_env(true, Some("nosmt  loglevel=7")).unwrap(), debug);
         // libkrun wraps each entry in quotes on the kernel command line.
         let err = guest_env(false, Some("bad\"arg")).unwrap_err();
         assert!(format!("{err:#}").contains("quote"), "{err:#}");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn x86_guests_skip_the_tsc_sync_check() {
+        assert!(
+            guest_env(false, None)
+                .unwrap()
+                .contains(&"tsc=reliable".to_string())
+        );
     }
 }
