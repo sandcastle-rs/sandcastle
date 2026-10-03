@@ -5,6 +5,8 @@ set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 mode="${2:-rootful}"
+# One state volume per flavour: the two images mount state at different paths and users.
+volume="$BUILDKIT_VOLUME-$mode"
 start() {
     local image="$BUILDKIT_IMAGE" args=(--privileged) extra=()
     local state=/var/lib/buildkit config=/etc/buildkit/buildkitd.toml
@@ -17,7 +19,7 @@ start() {
         config=/home/user/.config/buildkit/buildkitd.toml
     fi
     $ENGINE run -d --name "$BUILDKIT_NAME" --network host "${args[@]}" \
-        -v "$BUILDKIT_VOLUME:$state" \
+        -v "$volume:$state" \
         -v "$BENCH_DIR/buildkitd.toml:$config:ro" \
         "$image" ${extra[@]+"${extra[@]}"} >/dev/null
     for _ in $(seq 1 60); do
@@ -33,7 +35,7 @@ stop() {
 
 case "${1:-}" in
 start) stop; start ;;
-reset) stop; $ENGINE volume rm -f "$BUILDKIT_VOLUME" >/dev/null 2>&1 || true; start ;;
+reset) stop; $ENGINE volume rm -f "$volume" >/dev/null 2>&1 || true; start ;;
 stop) stop ;;
 *) echo "usage: $0 start|reset|stop [rootful|rootless]" >&2; exit 2 ;;
 esac

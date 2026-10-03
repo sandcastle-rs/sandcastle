@@ -7,7 +7,9 @@ if [[ -d "$dest" && "${1:-}" != "--force" ]]; then
     exit 0
 fi
 rm -rf "$dest"
-python3 - "$dest" <<'PY'
+tmp="$(mktemp -d "$dest.tmp.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+python3 - "$tmp" <<'PY'
 import os, random, sys
 root = sys.argv[1]
 rng = random.Random(42)
@@ -23,4 +25,5 @@ for f in range(20):
     with open(os.path.join(big, f"blob{f:02}.bin"), "wb") as out:
         out.write(rng.randbytes(5 << 20))
 PY
+mv "$tmp" "$dest"
 echo "generated $(find "$dest" -type f | wc -l | tr -d ' ') files in $dest"

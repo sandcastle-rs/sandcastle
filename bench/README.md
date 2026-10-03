@@ -17,14 +17,14 @@ Cases (`bench/cases/`):
 Modes:
 
 - `cold`: sandcastle runs with an empty `SANDCASTLE_ROOT` (no image store, no cache); BuildKit runs with a fresh daemon and an empty state volume.
-- `warm`: one warmup run, then timed runs reusing the sandcastle store and the BuildKit state volume. BuildKit is restarted before each run (untimed) and still runs with `--no-cache`, so only content such as base image layers is warm.
+- `warm`: one warmup run, then timed runs reusing the sandcastle store and the BuildKit state volume. BuildKit is restarted before each run (untimed) and still runs with `--no-cache`, so only content such as base image layers is warm. BuildKit also keeps its local-context sync state across warm runs, which can favour it on `large-copy` warm.
 
 The package cases download from the internet in every run, so they include network time.
 
 ## macOS setup
 
-1. `brew install hyperfine buildkit skopeo`
-2. Start a podman machine: `podman machine start`. For the rootful BuildKit mode the machine must be rootful (`podman machine set --rootful`, while stopped). If rootful BuildKit does not run there, use `--tools sandcastle,buildkit-rootless`.
+1. `brew install hyperfine buildkit skopeo` (python3 3.9 or newer is also needed, for `gen-context.sh`)
+2. Start a podman machine: `podman machine start`. For the rootful BuildKit mode the machine must be rootful (`podman machine set --rootful`, while stopped). If rootful BuildKit does not run there, use `--tools sandcastle,buildkit-rootless`. Rootless BuildKit inside the macOS podman machine was tried and fails at the first `RUN` (`error mounting "devpts" ... permission denied`), so on macOS use rootful.
 3. `bench/registry.sh start && bench/registry.sh seed`
 4. `just bench` (runs `just build` first). Arguments are passed through, for example `just bench --cases many-runs --runs 3`.
 
