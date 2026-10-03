@@ -372,3 +372,40 @@ fn nested_shell_traces_stay_in_the_log() {
         "{stderr}"
     );
 }
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn failed_build_still_reports_timings_and_trace() {
+    let ctx = tempfile::tempdir().unwrap();
+    let trace = ctx.path().join("trace.json");
+    let output = build_dockerfile(
+        ctx.path(),
+        "FROM mirror.gcr.io/library/alpine:3.20\nRUN true\nRUN true && false\n",
+        &["--timings", "--trace", trace.to_str().unwrap()],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let summary = stderr
+        .split("Steps by duration:")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no summary: {stderr}"));
+    for step in [
+        "s  step 1/3 FROM ",
+        "s  step 2/3 RUN true",
+        "s  step 3/3 RUN true && false",
+    ] {
+        assert!(summary.contains(step), "{step} missing: {stderr}");
+    }
+    let failing = stderr.split("[3/3] RUN true && false").nth(1).unwrap();
+    assert!(failing.contains("· command "), "{stderr}");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&trace).unwrap()).unwrap();
+    let names: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    for n in ["command", "cmd: false"] {
+        assert!(names.contains(&n), "{n} missing: {names:?}");
+    }
+}

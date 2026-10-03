@@ -36,7 +36,7 @@ pub struct Options {
     pub timings: bool,
     /// Where to write a Chrome trace, also when the build fails.
     pub trace: Option<PathBuf>,
-    /// Trace the commands of shell-form RUN with `sh -x`.
+    /// Trace the commands of shell-form RUN with `set -x`.
     pub trace_run: bool,
 }
 
@@ -138,7 +138,12 @@ fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descript
             args: Vec::new(),
         });
         step_times.push((label.clone(), dur));
-        result.context(label)?;
+        if let Err(e) = result {
+            if opts.timings {
+                print_summary(step_times);
+            }
+            return Err(e.context(label));
+        }
     }
     let descriptor = timed(trace, "write layout", || {
         image::write_layout(&blobs, &stage.state, &opts.output, &opts.tag)
@@ -235,19 +240,18 @@ fn run_step(
 
     let status = &finished.status;
     if status.exit_code != 0 {
-        let last = guest
-            .iter()
-            .rfind(|s| s.name.starts_with("cmd: "))
-            .zip(events.as_ref().and_then(|ev| ev.cmds.last()));
-        match last {
-            Some((span, cmd)) => bail!(
-                "exited with {}; last command started: {} ({:.1}s into the step)",
-                status.exit_code,
-                events::display_safe(&cmd.text),
-                span.start.saturating_sub(step_start).as_secs_f64()
-            ),
-            None => bail!("exited with {}", status.exit_code),
+        if env.opts.timings && events.is_some() {
+            eprint!(
+                "{}",
+                phase_lines(&guest, Duration::ZERO, is_copy, shell_form)
+            );
         }
+        bail!(failure_message(
+            status.exit_code,
+            &guest,
+            events.as_ref(),
+            step_start
+        ));
     }
     let mut ingested = Duration::ZERO;
     match &status.layer {
@@ -273,6 +277,28 @@ fn run_step(
         eprint!("{}", phase_lines(&guest, ingested, is_copy, shell_form));
     }
     Ok(())
+}
+
+/// Why a step failed: its exit code and, for traced shell-form RUN, the
+/// last command started and when, relative to `step_start`.
+fn failure_message(
+    exit_code: i32,
+    guest: &[Span],
+    events: Option<&events::GuestEvents>,
+    step_start: Duration,
+) -> String {
+    let last = guest
+        .iter()
+        .rfind(|s| s.name.starts_with("cmd: "))
+        .zip(events.and_then(|ev| ev.cmds.last()));
+    match last {
+        Some((span, cmd)) => format!(
+            "exited with {exit_code}; last command started: {} ({:.1}s into the step)",
+            events::display_safe(&cmd.text),
+            span.start.saturating_sub(step_start).as_secs_f64()
+        ),
+        None => format!("exited with {exit_code}"),
+    }
 }
 
 /// Formats one step's phase durations and, for traced shell-form RUN, its
@@ -364,6 +390,63 @@ mod tests {
         assert_eq!(
             out,
             "  kernel boot 1.50s · vmm 0.00s · unpack 0.00s · command 3.00s · commit 0.00s · ingest 0.25s\n    2.00s  slow\n    0.01s  fast\n"
+        );
+    }
+
+    /// Guest events of a step whose VM ran from 100ms to 300ms on the host
+    /// clock, with `cmds` as `(text, start_us)`.
+    fn step_events(cmds: &[(&str, u64)]) -> (Vec<Span>, events::GuestEvents) {
+        let mut input = String::from(
+            "{\"type\":\"phase\",\"name\":\"command\",\"start_us\":1000,\"dur_us\":9000}\n",
+        );
+        for (text, start_us) in cmds {
+            let cmd = sandcastle_proto::Event::Cmd {
+                text: (*text).into(),
+                start_us: *start_us,
+            };
+            input.push_str(&serde_json::to_string(&cmd).unwrap());
+            input.push('\n');
+        }
+        input.push_str("{\"type\":\"end\",\"at_us\":12000}\n");
+        let ev = events::parse(input.as_bytes());
+        let guest =
+            events::guest_spans(&ev, Duration::from_millis(100), Duration::from_millis(300));
+        (guest, ev)
+    }
+
+    #[test]
+    fn failure_names_the_last_command_and_its_offset() {
+        let (guest, ev) = step_events(&[("true", 2000), ("false", 4000)]);
+        // helper start = 300ms - 12ms; "false" starts 4ms later, 192ms
+        // after a step that started at 100ms.
+        assert_eq!(
+            failure_message(1, &guest, Some(&ev), Duration::from_millis(100)),
+            "exited with 1; last command started: false (0.2s into the step)"
+        );
+    }
+
+    #[test]
+    fn failure_without_commands_gives_the_exit_code() {
+        // Exec-form and untraced RUN, and COPY, record no cmds.
+        let (guest, ev) = step_events(&[]);
+        assert_eq!(
+            failure_message(3, &guest, Some(&ev), Duration::ZERO),
+            "exited with 3"
+        );
+        assert_eq!(
+            failure_message(127, &[], None, Duration::ZERO),
+            "exited with 127"
+        );
+    }
+
+    #[test]
+    fn failure_escapes_the_command_text() {
+        let (guest, ev) = step_events(&[("test \u{1b}[2J = x", 2000)]);
+        let msg = failure_message(1, &guest, Some(&ev), Duration::ZERO);
+        assert!(!msg.contains('\u{1b}'), "{msg:?}");
+        assert!(
+            msg.contains("last command started: test \\x1b[2J = x ("),
+            "{msg}"
         );
     }
 
