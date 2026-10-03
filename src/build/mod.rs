@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod dns;
+pub mod events;
 
 use std::io;
 use std::path::{Path, PathBuf};
