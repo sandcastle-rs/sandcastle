@@ -54,8 +54,8 @@ impl Trace {
                 serde_json::json!({
                     "name": s.name,
                     "ph": "X",
-                    "ts": s.start.as_micros() as u64,
-                    "dur": s.dur.as_micros() as u64,
+                    "ts": u64::try_from(s.start.as_micros()).unwrap_or(u64::MAX),
+                    "dur": u64::try_from(s.dur.as_micros()).unwrap_or(u64::MAX),
                     "pid": 1,
                     "tid": 1,
                     "args": args,

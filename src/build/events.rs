@@ -58,12 +58,18 @@ pub fn parse(bytes: &[u8]) -> GuestEvents {
                 detail,
                 start_us,
                 dur_us,
-            }) => ev.phases.push(GuestPhase {
-                name: clip(name),
-                detail: detail.map(clip),
-                start_us,
-                dur_us,
-            }),
+            }) => {
+                if ev.phases.len() < MAX_CMD_EVENTS {
+                    ev.phases.push(GuestPhase {
+                        name: clip(name),
+                        detail: detail.map(clip),
+                        start_us,
+                        dur_us,
+                    });
+                } else {
+                    ev.dropped = ev.dropped.saturating_add(1);
+                }
+            }
             Ok(Event::Cmd { text, start_us }) => {
                 if ev.cmds.len() < MAX_CMD_EVENTS {
                     ev.cmds.push(GuestCmd {
@@ -71,7 +77,7 @@ pub fn parse(bytes: &[u8]) -> GuestEvents {
                         start_us,
                     });
                 } else {
-                    ev.dropped += 1;
+                    ev.dropped = ev.dropped.saturating_add(1);
                 }
             }
             Ok(Event::Limits {
@@ -110,6 +116,7 @@ pub fn guest_spans(ev: &GuestEvents, vm_start: Duration, vm_end: Duration) -> Ve
         return Vec::new();
     };
     let us = Duration::from_micros;
+    let vm_end = vm_end.max(vm_start);
     let mut spans = Vec::new();
     let kernel_start = h
         .saturating_sub(us(ev.kernel_boot_us.unwrap_or(0)))
@@ -137,10 +144,10 @@ pub fn guest_spans(ev: &GuestEvents, vm_start: Duration, vm_end: Duration) -> Ve
         let args = p
             .detail
             .iter()
-            .map(|d| ("detail".to_string(), d.clone()))
+            .map(|d| ("detail".to_string(), display_safe(d)))
             .collect();
         spans.push(span(
-            &p.name,
+            &display_safe(&p.name),
             h.saturating_add(us(p.start_us)),
             us(p.dur_us),
             args,
@@ -166,6 +173,13 @@ pub fn guest_spans(ev: &GuestEvents, vm_start: Duration, vm_end: Duration) -> Ve
             vec![],
         ));
     }
+    // The guest picks every offset; keep its spans inside the VM's lifetime.
+    for s in &mut spans {
+        let start = s.start.clamp(vm_start, vm_end);
+        let end = s.start.saturating_add(s.dur).clamp(start, vm_end);
+        s.start = start;
+        s.dur = end - start;
+    }
     spans
 }
 
@@ -178,17 +192,29 @@ fn span(name: &str, start: Duration, dur: Duration, args: Vec<(String, String)>)
     }
 }
 
-/// Escapes control characters so guest text cannot drive the terminal.
+/// Escapes control characters and invisible Unicode format characters
+/// (bidi overrides and the like) so guest text can neither drive the
+/// terminal nor spoof what is printed.
 pub fn display_safe(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if c.is_control() {
             out.push_str(&format!("\\x{:02x}", c as u32));
+        } else if is_format_char(c) {
+            out.push_str(&format!("\\u{{{:04x}}}", c as u32));
         } else {
             out.push(c);
         }
     }
     out
+}
+
+/// Unicode general category Cf characters worth escaping (std has no
+/// category API, so the ranges are listed).
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+        | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
 }
 
 #[cfg(test)]
@@ -262,5 +288,64 @@ mod tests {
     fn display_safe_escapes_controls() {
         assert_eq!(display_safe("rm \u{1b}[2Jx\tok"), "rm \\x1b[2Jx\\x09ok");
         assert_eq!(display_safe("café"), "café");
+    }
+
+    #[test]
+    fn display_safe_escapes_c1_and_format_characters() {
+        assert_eq!(display_safe("a\u{9b}b"), "a\\x9bb");
+        assert_eq!(display_safe("a\u{202e}b\u{2066}"), "a\\u{202e}b\\u{2066}");
+    }
+
+    #[test]
+    fn hostile_limits_cannot_overflow_dropped() {
+        let mut input = String::from(
+            "{\"type\":\"limits\",\"cmd_events_dropped\":18446744073709551615,\"truncated\":18446744073709551615}\n",
+        );
+        for _ in 0..sandcastle_proto::MAX_CMD_EVENTS + 3 {
+            input.push_str("{\"type\":\"cmd\",\"text\":\"x\",\"start_us\":1}\n");
+        }
+        let ev = parse(input.as_bytes());
+        assert_eq!(ev.dropped, u64::MAX);
+        assert_eq!(ev.truncated, u64::MAX);
+    }
+
+    #[test]
+    fn phases_are_capped() {
+        let mut input = String::new();
+        for _ in 0..sandcastle_proto::MAX_CMD_EVENTS + 2 {
+            input.push_str("{\"type\":\"phase\",\"name\":\"p\",\"start_us\":1,\"dur_us\":1}\n");
+        }
+        let ev = parse(input.as_bytes());
+        assert_eq!(ev.phases.len(), sandcastle_proto::MAX_CMD_EVENTS);
+        assert_eq!(ev.dropped, 2);
+    }
+
+    #[test]
+    fn clip_truncates_at_a_char_boundary() {
+        let s = "é".repeat(sandcastle_proto::MAX_CMD_TEXT);
+        let clipped = clip(s);
+        assert!(clipped.len() <= sandcastle_proto::MAX_CMD_TEXT);
+        assert!(clipped.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn hostile_offsets_stay_inside_the_vm() {
+        let max = u64::MAX;
+        let input = format!(
+            "{{\"type\":\"boot\",\"kernel_boot_us\":{max}}}\n\
+             {{\"type\":\"phase\",\"name\":\"p\\u001b\",\"detail\":\"d\\u202e\",\"start_us\":{max},\"dur_us\":{max}}}\n\
+             {{\"type\":\"cmd\",\"text\":\"x\",\"start_us\":{max}}}\n\
+             {{\"type\":\"end\",\"at_us\":{max}}}\n"
+        );
+        let ev = parse(input.as_bytes());
+        let (a, b) = (Duration::from_millis(100), Duration::from_millis(300));
+        let spans = guest_spans(&ev, a, b);
+        assert!(!spans.is_empty());
+        for s in &spans {
+            assert!(s.start >= a && s.start + s.dur <= b, "{s:?}");
+        }
+        let p = spans.iter().find(|s| s.name.starts_with('p')).unwrap();
+        assert_eq!(p.name, "p\\x1b");
+        assert_eq!(p.args[0].1, "d\\u{202e}");
     }
 }
