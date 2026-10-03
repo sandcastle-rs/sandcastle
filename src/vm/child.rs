@@ -38,13 +38,12 @@ fn try_enter(job_dir: &Path) -> Result<Infallible> {
         ctx.add_virtiofs(&share.tag, &share.path, share.read_only)?;
     }
     ctx.set_workdir("/")?;
-    let kmsg = format!("{KMSG_ENV}=1");
-    let env: &[&str] = if std::env::var_os(super::DEBUG_KMSG_ENV).is_some() {
-        &["HOME=/", &kmsg]
-    } else {
-        &["HOME=/"]
-    };
-    ctx.set_exec(GUEST_HELPER_PATH, &[], env)?;
+    let env = guest_env(
+        std::env::var_os(super::DEBUG_KMSG_ENV).is_some(),
+        std::env::var(super::DEBUG_KERNEL_ARGS_ENV).ok().as_deref(),
+    )?;
+    let env: Vec<&str> = env.iter().map(String::as_str).collect();
+    ctx.set_exec(GUEST_HELPER_PATH, &[], &env)?;
     #[cfg(target_os = "linux")]
     super::landlock::restrict(&spec)?;
     let configured_ns = unix_ns();
@@ -59,6 +58,24 @@ fn try_enter(job_dir: &Path) -> Result<Infallible> {
         let _ = file.write_all(&serde_json::to_vec(&marks)?);
     }
     Err(ctx.start_enter())
+}
+
+/// The guest helper's environment. libkrun writes each entry, in double
+/// quotes, onto the guest kernel's command line; the kernel takes the ones
+/// it knows as boot parameters, which is how `kernel_args` reach it.
+fn guest_env(kmsg: bool, kernel_args: Option<&str>) -> Result<Vec<String>> {
+    let mut env = vec!["HOME=/".to_string()];
+    if kmsg {
+        env.push(format!("{KMSG_ENV}=1"));
+    }
+    for arg in kernel_args.unwrap_or_default().split_whitespace() {
+        anyhow::ensure!(
+            !arg.contains('"'),
+            "kernel argument {arg:?} contains a double quote"
+        );
+        env.push(arg.to_string());
+    }
+    Ok(env)
 }
 
 /// libkrun's virtio-fs server holds a host fd for every guest inode it has
@@ -97,4 +114,21 @@ fn die_with_parent() -> Result<()> {
         "sandcastle exited before the VM started"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_env_carries_debug_flags_and_kernel_args() {
+        assert_eq!(guest_env(false, None).unwrap(), ["HOME=/"]);
+        assert_eq!(
+            guest_env(true, Some("tsc=reliable  loglevel=7")).unwrap(),
+            ["HOME=/", "SANDCASTLE_KMSG=1", "tsc=reliable", "loglevel=7"]
+        );
+        // libkrun wraps each entry in quotes on the kernel command line.
+        let err = guest_env(false, Some("bad\"arg")).unwrap_err();
+        assert!(format!("{err:#}").contains("quote"), "{err:#}");
+    }
 }
