@@ -1,4 +1,4 @@
-//! Separates `sh -x` trace lines from a RUN step's stderr. The shell runs
+//! Separates `set -x` trace lines from a RUN step's stderr. The shell runs
 //! with `PS4` set to a per-job marker; from a marker to the end of its line
 //! is the command the shell is about to run. A marker may follow output
 //! that had no trailing newline. Everything else is forwarded as it

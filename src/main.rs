@@ -65,7 +65,10 @@ enum Command {
         /// Write a Chrome trace (open in ui.perfetto.dev) to FILE, also on failure.
         #[arg(long, value_name = "FILE")]
         trace: Option<PathBuf>,
-        /// Run shell-form RUN without `sh -x` command tracing.
+        /// Run shell-form RUN without command tracing.
+        ///
+        /// Shell-form RUN is traced with `set -x`; commands after `set +x`
+        /// and inside separate scripts are not attributed.
         #[arg(long)]
         no_trace_run: bool,
     },

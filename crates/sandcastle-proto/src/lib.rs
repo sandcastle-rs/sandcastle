@@ -67,7 +67,7 @@ pub enum Event {
         start_us: u64,
         dur_us: u64,
     },
-    /// A shell command the traced `sh -x` started.
+    /// A shell command the traced shell (`set -x`) started.
     Cmd { text: String, start_us: u64 },
     Limits {
         cmd_events_dropped: u64,
@@ -89,7 +89,7 @@ pub struct RunJob {
     /// Contents of the step's `/etc/resolv.conf`.
     pub resolv_conf: String,
     /// `argv` is `["/bin/sh", "-c", cmd]` from a shell-form RUN; the guest
-    /// traces it with `sh -x` to report the last command started.
+    /// traces it with `set -x` to report the last command started.
     #[serde(default)]
     pub shell_form: bool,
 }

@@ -105,8 +105,8 @@ A `cmd` span ends where the next `cmd` starts, or at the end of `command`.
 ### Failing-command detection (guest)
 
 - **Shell form only.** `RunJob` gains `shell_form: bool`. The host sets it when it built `["/bin/sh", "-c", cmd]` from a shell-form `RUN`. Exec form is never traced. With `--no-trace-run`, the host sends `shell_form: false`.
-- **Traced invocation.** For a shell-form job, the guest runs `/bin/sh -x -c cmd`. It sets `PS4` to `+sc-<token>> `, where `<token>` is 12 random hex characters read from `/dev/urandom` for each job.
-- **Splitting stderr.** The command's stderr is a pipe read by the helper; stdout stays on the console. The helper passes stderr through byte by byte as it arrives. Only a line that starts with the marker is held back until its newline; it is then removed from the output and becomes a `cmd` event with the arrival time. A partial line that could still turn out to be the marker is buffered only until it can be decided. Progress output using `\r` passes through unchanged.
+- **Traced invocation.** For a shell-form job, the guest runs `/bin/sh -c "PS4='+sc-<token>> '; set -x; cmd"`, where `<token>` is 12 random hex characters read from `/dev/urandom` for each job. `PS4` is set in the script, not exported: bash ignores `PS4` from the environment when run as root, and an exported `PS4` would hide the traces of nested shells.
+- **Splitting stderr.** The command's stderr is a pipe read by the helper; stdout stays on the console. The helper passes stderr through byte by byte as it arrives. Only text from a marker to its newline is held back (a marker may follow output without a trailing newline); it is then removed from the output and becomes a `cmd` event with the arrival time. A partial line that could still turn out to be the marker is buffered only until it can be decided. Progress output using `\r` passes through unchanged.
 - **Failure attribution.** When the command exits non-zero, the last `cmd` event is the last command started. In `a && b && c` that is the command that failed; in a pipeline it is the last stage started. The proto, the status and the guest do not interpret it further.
 
 ### Host failure message
@@ -161,7 +161,7 @@ The guest is untrusted; events are data, never instructions.
 
 ### Known limits (documented)
 
-- `PS4` is visible in the step's environment.
+- `PS4` is visible as a shell variable of the step's script.
 - A script that runs `set +x` stops tracing from that point; the error then names the last traced command.
 - A script started as its own shell (`sh build.sh`) is traced as one command.
 - stderr now passes through the helper, so the ordering between stdout and stderr lines can shift slightly.
