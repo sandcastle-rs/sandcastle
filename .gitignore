@@ -1,2 +1,4 @@
 /target
 /lib
+/bench/results/*/
+/bench/cases/large-copy/data/
