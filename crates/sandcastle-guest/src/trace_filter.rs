@@ -1,42 +1,33 @@
 //! Separates `sh -x` trace lines from a RUN step's stderr. The shell runs
-//! with `PS4` set to a per-job marker; lines that start with it are the
-//! commands the shell is about to run. Everything else is forwarded as it
+//! with `PS4` set to a per-job marker; from a marker to the end of its line
+//! is the command the shell is about to run. A marker may follow output
+//! that had no trailing newline. Everything else is forwarded as it
 //! arrives, holding back at most a possible marker prefix.
 
 use sandcastle_proto::MAX_CMD_TEXT;
 
-/// Longest run of leading `+` accepted (bash repeats PS4's first character
-/// once per nesting level).
+/// Longest run of `+` accepted before the marker (bash repeats PS4's first
+/// character once per nesting level).
 const MAX_PLUS: usize = 64;
 
 pub struct MarkerFilter {
     /// The marker after the leading `+` run: `sc-<token>> `.
     tail: Vec<u8>,
-    state: State,
-    /// Bytes held back while a line start may still be a marker.
+    /// Inside a marker line; bytes go to `cmd`.
+    capturing: bool,
+    /// Bytes held back while they may still begin a marker; always empty
+    /// or starting with `+`.
     pending: Vec<u8>,
     /// Command text of the marker line being read.
     cmd: Vec<u8>,
     truncated: u64,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum State {
-    /// At the start of a line, nothing held back.
-    LineStart,
-    /// `pending` is a possible marker prefix.
-    Deciding,
-    /// Inside an ordinary line.
-    Passing,
-    /// Inside a marker line; bytes go to `cmd`.
-    Capturing,
-}
-
 impl MarkerFilter {
     pub fn new(token: &str) -> Self {
         Self {
             tail: format!("sc-{token}> ").into_bytes(),
-            state: State::LineStart,
+            capturing: false,
             pending: Vec::new(),
             cmd: Vec::new(),
             truncated: 0,
@@ -54,51 +45,52 @@ impl MarkerFilter {
 
     pub fn feed(&mut self, chunk: &[u8], out: &mut Vec<u8>, cmds: &mut Vec<String>) {
         for &b in chunk {
-            match self.state {
-                State::Passing => {
-                    out.push(b);
-                    if b == b'\n' {
-                        self.state = State::LineStart;
-                    }
+            if self.capturing {
+                if b == b'\n' {
+                    self.emit(cmds);
+                    self.capturing = false;
+                } else if self.cmd.len() <= MAX_CMD_TEXT * 4 {
+                    self.cmd.push(b);
                 }
-                State::Capturing => {
-                    if b == b'\n' {
-                        self.emit(cmds);
-                        self.state = State::LineStart;
-                    } else if self.cmd.len() <= MAX_CMD_TEXT * 4 {
-                        self.cmd.push(b);
-                    }
-                }
-                State::LineStart | State::Deciding => {
-                    self.pending.push(b);
-                    match self.classify() {
-                        Prefix::Complete => {
-                            self.pending.clear();
-                            self.state = State::Capturing;
-                        }
-                        Prefix::Partial => self.state = State::Deciding,
-                        Prefix::No => {
-                            out.append(&mut self.pending);
-                            self.state = if b == b'\n' {
-                                State::LineStart
-                            } else {
-                                State::Passing
-                            };
-                        }
-                    }
-                }
+            } else if self.pending.is_empty() && b != b'+' {
+                out.push(b);
+            } else {
+                self.pending.push(b);
+                self.settle(out);
             }
         }
     }
 
     /// End of stream: flush held bytes; an unterminated marker line is a cmd.
     pub fn finish(&mut self, out: &mut Vec<u8>, cmds: &mut Vec<String>) {
-        match self.state {
-            State::Capturing => self.emit(cmds),
-            State::Deciding => out.append(&mut self.pending),
-            State::LineStart | State::Passing => {}
+        if self.capturing {
+            self.emit(cmds);
+            self.capturing = false;
         }
-        self.state = State::LineStart;
+        out.append(&mut self.pending);
+    }
+
+    /// Forwards the held bytes that can no longer begin a marker and starts
+    /// capturing once one is complete.
+    fn settle(&mut self, out: &mut Vec<u8>) {
+        while !self.pending.is_empty() {
+            match self.classify() {
+                Prefix::Complete => {
+                    self.pending.clear();
+                    self.capturing = true;
+                    return;
+                }
+                Prefix::Partial => return,
+                Prefix::No => {
+                    // A marker can only begin at a later `+`.
+                    let next = self.pending[1..]
+                        .iter()
+                        .position(|&b| b == b'+')
+                        .map_or(self.pending.len(), |i| i + 1);
+                    out.extend(self.pending.drain(..next));
+                }
+            }
+        }
     }
 
     fn classify(&self) -> Prefix {
@@ -170,10 +162,31 @@ mod tests {
     }
 
     #[test]
-    fn wrong_token_and_mid_line_markers_pass_through() {
-        let (out, cmds) = run("ab12", &[b"+sc-zz99> fake\nsay +sc-ab12> no\n"]);
-        assert_eq!(out, b"+sc-zz99> fake\nsay +sc-ab12> no\n");
+    fn wrong_tokens_pass_through_at_line_start_and_mid_line() {
+        let (out, cmds) = run("ab12", &[b"+sc-zz99> fake\nsay +sc-zz99> no\n"]);
+        assert_eq!(out, b"+sc-zz99> fake\nsay +sc-zz99> no\n");
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn marker_after_unterminated_output_is_a_cmd() {
+        let (out, cmds) = run("ab12", &[b"x+sc-ab12> false\n"]);
+        assert_eq!(out, b"x");
+        assert_eq!(cmds, ["false"]);
+    }
+
+    #[test]
+    fn mid_line_marker_split_across_reads() {
+        let (out, cmds) = run("ab12", &[b"x+", b"+sc-ab", b"12> fal", b"se\nok\n"]);
+        assert_eq!(out, b"xok\n");
+        assert_eq!(cmds, ["false"]);
+    }
+
+    #[test]
+    fn plus_signs_before_a_failed_prefix_are_forwarded() {
+        let (out, cmds) = run("ab12", &[b"a+b++sc-ab+sc-ab12> c\n"]);
+        assert_eq!(out, b"a+b++sc-ab");
+        assert_eq!(cmds, ["c"]);
     }
 
     #[test]
@@ -190,6 +203,14 @@ mod tests {
     }
 
     #[test]
+    fn plus_run_longer_than_the_nesting_limit_keeps_only_the_limit() {
+        let input = format!("{}sc-ab12> deep\n", "+".repeat(MAX_PLUS + 3));
+        let (out, cmds) = run("ab12", &[input.as_bytes()]);
+        assert_eq!(out, b"+++");
+        assert_eq!(cmds, ["deep"]);
+    }
+
+    #[test]
     fn long_line_without_newline_is_forwarded_with_bounded_buffer() {
         let mut f = MarkerFilter::new("ab12");
         let (mut out, mut cmds) = (Vec::new(), Vec::new());
@@ -197,11 +218,9 @@ mod tests {
         f.feed(&chunk, &mut out, &mut cmds);
         assert_eq!(out.len(), chunk.len(), "nothing held back mid-line");
         f.feed(b"+sc-", &mut out, &mut cmds);
-        assert_eq!(
-            out.len(),
-            chunk.len() + 4,
-            "mid-line text is never a marker"
-        );
+        assert_eq!(out.len(), chunk.len(), "only a possible marker is held");
+        f.feed(b"x", &mut out, &mut cmds);
+        assert_eq!(out.len(), chunk.len() + 5);
     }
 
     #[test]
