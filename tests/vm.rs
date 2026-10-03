@@ -535,6 +535,32 @@ fn cmds(events: &[Event]) -> Vec<String> {
 
 #[test]
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn vm_child_marks_its_start_up_in_order() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm {
+        exe: &exe,
+        install: &install,
+        store: &store,
+        resources: Resources::default(),
+    };
+    let finished = vm.run(&run_job(busybox(&store), "true", ""), None).unwrap();
+    let m = finished.marks.expect("the __vm child wrote its marks");
+    let order = [
+        finished.started_ns,
+        m.main_ns,
+        m.loaded_ns,
+        m.configured_ns,
+        m.enter_ns,
+        finished
+            .helper_end_ns
+            .expect("status.json has a modification time"),
+        finished.ended_ns,
+    ];
+    assert!(order.windows(2).all(|w| w[0] <= w[1]), "{order:?}");
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn traced_chain_reports_the_failing_command_last() {
     let (_dir, exe, install, store) = store();
     let vm = Vm {
