@@ -88,6 +88,7 @@ fn run_step(
                 user: stage.user(),
                 workdir: stage.workdir(),
                 resolv_conf: resolv_conf.to_string(),
+                shell_form: false,
             }),
             None,
         ),

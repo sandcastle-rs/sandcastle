@@ -224,6 +224,7 @@ fn run_job(lower: Vec<LowerLayer>, script: &str, user: &str) -> Job {
         user: user.into(),
         workdir: "/work".into(),
         resolv_conf: "nameserver 8.8.8.8\n".into(),
+        shell_form: false,
     })
 }
 
