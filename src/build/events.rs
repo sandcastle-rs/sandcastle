@@ -121,21 +121,69 @@ fn clip(mut s: String) -> String {
     s
 }
 
-pub fn helper_start(ev: &GuestEvents, vm_end: Duration) -> Option<Duration> {
-    ev.end_us
-        .map(|end| vm_end.saturating_sub(Duration::from_micros(end)))
+/// Where one VM's life sits on the build timeline, from host measurements.
+#[derive(Debug, Clone, Copy)]
+pub struct VmTimeline {
+    /// The `__vm` process was spawned and exited.
+    pub start: Duration,
+    pub end: Duration,
+    /// The child's start-up marks, when it wrote them.
+    pub host: Option<HostMarks>,
+    /// The guest's last write of `status.json` on the host clock: the end
+    /// of the guest helper.
+    pub helper_end: Option<Duration>,
 }
 
-pub fn guest_spans(ev: &GuestEvents, vm_start: Duration, vm_end: Duration) -> Vec<Span> {
-    let Some(h) = helper_start(ev, vm_end) else {
+impl VmTimeline {
+    /// Process lifetime only, without marks.
+    pub fn new(start: Duration, end: Duration) -> Self {
+        Self {
+            start,
+            end,
+            host: None,
+            helper_end: None,
+        }
+    }
+}
+
+/// See [`crate::vm::VmMarks`]; offsets on the build timeline.
+#[derive(Debug, Clone, Copy)]
+pub struct HostMarks {
+    pub main: Duration,
+    pub loaded: Duration,
+    pub configured: Duration,
+    pub enter: Duration,
+}
+
+pub fn guest_spans(ev: &GuestEvents, vm: &VmTimeline) -> Vec<Span> {
+    let vm_start = vm.start;
+    let vm_end = vm.end.max(vm_start);
+    // Marks only count when they are in order inside the process lifetime.
+    let host = vm.host.filter(|m| {
+        vm_start <= m.main
+            && m.main <= m.loaded
+            && m.loaded <= m.configured
+            && m.configured <= m.enter
+            && m.enter <= vm_end
+    });
+    let entered = host.map_or(vm_start, |m| m.enter);
+    // The helper's end, stamped on the host clock, anchors the guest's
+    // timeline; without it the helper is assumed to end as the VM exits.
+    let helper_end = vm
+        .helper_end
+        .filter(|&t| entered <= t && t <= vm_end)
+        .unwrap_or(vm_end);
+    let Some(h) = ev
+        .end_us
+        .map(|end| helper_end.saturating_sub(Duration::from_micros(end)))
+    else {
         return Vec::new();
     };
     let us = Duration::from_micros;
-    let vm_end = vm_end.max(vm_start);
     let mut spans = Vec::new();
     let kernel_start = h
         .saturating_sub(us(ev.kernel_boot_us.unwrap_or(0)))
-        .max(vm_start);
+        .max(entered);
     if ev.kernel_boot_us.is_some() {
         spans.push(span(
             "kernel boot",
@@ -144,8 +192,14 @@ pub fn guest_spans(ev: &GuestEvents, vm_start: Duration, vm_end: Duration) -> Ve
             vec![],
         ));
     }
-    if kernel_start > vm_start {
-        spans.push(span(
+    match host {
+        Some(m) => {
+            spans.push(span("process start", vm_start, m.main - vm_start, vec![]));
+            spans.push(span("libkrun load", m.main, m.loaded - m.main, vec![]));
+            spans.push(span("vm configure", m.loaded, m.enter - m.loaded, vec![]));
+            spans.push(span("vm create", m.enter, kernel_start - m.enter, vec![]));
+        }
+        None if kernel_start > vm_start => spans.push(span(
             "vmm setup",
             vm_start,
             kernel_start - vm_start,
@@ -153,7 +207,11 @@ pub fn guest_spans(ev: &GuestEvents, vm_start: Duration, vm_end: Duration) -> Ve
                 "note".into(),
                 "includes VM teardown; split is approximate".into(),
             )],
-        ));
+        )),
+        None => {}
+    }
+    if helper_end < vm_end {
+        spans.push(span("vm teardown", helper_end, vm_end - helper_end, vec![]));
     }
     for p in &ev.phases {
         let args = p
@@ -292,7 +350,10 @@ mod tests {
 "#,
         );
         assert_eq!(ev.malformed, 2);
-        let spans = guest_spans(&ev, Duration::ZERO, Duration::from_millis(1));
+        let spans = guest_spans(
+            &ev,
+            &VmTimeline::new(Duration::ZERO, Duration::from_millis(1)),
+        );
         assert!(spans.iter().any(|s| s.name == "unpack"));
         assert!(
             !spans
@@ -311,7 +372,10 @@ mod tests {
     fn guest_spans_align_to_vm_end() {
         let ev = parse(GOOD.as_bytes());
         // VM ran from 100ms to 300ms on the host clock.
-        let spans = guest_spans(&ev, Duration::from_millis(100), Duration::from_millis(300));
+        let spans = guest_spans(
+            &ev,
+            &VmTimeline::new(Duration::from_millis(100), Duration::from_millis(300)),
+        );
         let find = |n: &str| {
             spans
                 .iter()
@@ -326,16 +390,101 @@ mod tests {
         // "true" runs until "false" starts; "false" until command ends.
         assert_eq!(find("cmd: true").dur, Duration::from_millis(2));
         assert_eq!(find("cmd: false").dur, Duration::from_millis(4));
+    }
+
+    fn marked(helper_end_ms: u64) -> VmTimeline {
+        let ms = Duration::from_millis;
+        VmTimeline {
+            start: ms(100),
+            end: ms(300),
+            host: Some(HostMarks {
+                main: ms(105),
+                loaded: ms(140),
+                configured: ms(150),
+                enter: ms(151),
+            }),
+            helper_end: Some(ms(helper_end_ms)),
+        }
+    }
+
+    #[test]
+    fn host_marks_split_vmm_setup_and_teardown() {
+        let ev = parse(GOOD.as_bytes());
+        let spans = guest_spans(&ev, &marked(290));
+        let find = |n: &str| {
+            spans
+                .iter()
+                .find(|s| s.name == n)
+                .unwrap_or_else(|| panic!("{n}: {spans:?}"))
+        };
+        let ms = Duration::from_millis;
+        // Guest helper ends at 290ms (status.json mtime), 12ms after it
+        // started at 278ms; the kernel started 90ms before that, at 188ms.
         assert_eq!(
-            helper_start(&ev, Duration::from_millis(300)),
-            Some(Duration::from_millis(288))
+            (find("process start").start, find("process start").dur),
+            (ms(100), ms(5))
         );
+        assert_eq!(
+            (find("libkrun load").start, find("libkrun load").dur),
+            (ms(105), ms(35))
+        );
+        assert_eq!(
+            (find("vm configure").start, find("vm configure").dur),
+            (ms(140), ms(11))
+        );
+        assert_eq!(
+            (find("vm create").start, find("vm create").dur),
+            (ms(151), ms(37))
+        );
+        assert_eq!(
+            (find("kernel boot").start, find("kernel boot").dur),
+            (ms(188), ms(90))
+        );
+        assert_eq!(
+            (find("vm teardown").start, find("vm teardown").dur),
+            (ms(290), ms(10))
+        );
+        assert_eq!(find("command").start, ms(281));
+        assert!(spans.iter().all(|s| s.name != "vmm setup"), "{spans:?}");
+    }
+
+    #[test]
+    fn out_of_order_marks_fall_back_to_vmm_setup() {
+        let ev = parse(GOOD.as_bytes());
+        let mut t = marked(290);
+        if let Some(h) = t.host.as_mut() {
+            h.loaded = Duration::from_millis(101); // before `main`
+        }
+        let spans = guest_spans(&ev, &t);
+        assert!(spans.iter().any(|s| s.name == "vmm setup"), "{spans:?}");
+        assert!(spans.iter().all(|s| s.name != "libkrun load"), "{spans:?}");
+    }
+
+    #[test]
+    fn helper_end_outside_the_vm_is_ignored() {
+        let ev = parse(GOOD.as_bytes());
+        for bad in [350, 120] {
+            let spans = guest_spans(&ev, &marked(bad));
+            assert!(
+                spans.iter().all(|s| s.name != "vm teardown"),
+                "{bad}: {spans:?}"
+            );
+            // Falls back to anchoring the helper's end at the VM's exit.
+            let command = spans.iter().find(|s| s.name == "command").unwrap();
+            assert_eq!(command.start, Duration::from_millis(291), "{bad}");
+        }
     }
 
     #[test]
     fn no_end_event_gives_no_guest_spans() {
         let ev = parse(br#"{"type":"cmd","text":"x","start_us":1}"#);
-        assert!(guest_spans(&ev, Duration::ZERO, Duration::from_secs(1)).is_empty());
+        assert!(
+            guest_spans(
+                &ev,
+                &VmTimeline::new(Duration::ZERO, Duration::from_secs(1))
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -393,7 +542,7 @@ mod tests {
         );
         let ev = parse(input.as_bytes());
         let (a, b) = (Duration::from_millis(100), Duration::from_millis(300));
-        let spans = guest_spans(&ev, a, b);
+        let spans = guest_spans(&ev, &VmTimeline::new(a, b));
         assert!(!spans.is_empty());
         for s in &spans {
             assert!(s.start >= a && s.start + s.dur <= b, "{s:?}");

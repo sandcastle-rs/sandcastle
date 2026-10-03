@@ -20,7 +20,7 @@ use crate::install::{self, Install};
 use crate::registry;
 use crate::store::Store;
 use crate::trace::{Span, Trace};
-use crate::vm::{self, Resources, Vm};
+use crate::vm::{self, Finished, Resources, Vm};
 use config::{Action, Stage};
 
 /// Longest instruction text shown in progress and error messages.
@@ -224,9 +224,10 @@ fn run_step(
         dur: vm_end.saturating_sub(vm_start),
         args: Vec::new(),
     });
+    let timeline = vm_timeline(&finished, vm_start, vm_end);
     let guest = events
         .as_ref()
-        .map(|ev| events::guest_spans(ev, vm_start, vm_end))
+        .map(|ev| events::guest_spans(ev, &timeline))
         .unwrap_or_default();
     for span in &guest {
         trace.push(span.clone());
@@ -304,6 +305,32 @@ fn failure_message(
 /// Formats one step's phase durations and, for traced shell-form RUN, its
 /// slowest commands. `guest` holds guest-named spans; `ingested` is measured
 /// on the host.
+/// Places the child's wall-clock marks and the guest's `status.json` write
+/// on the build timeline, relative to the VM process's spawn.
+fn vm_timeline(finished: &Finished, vm_start: Duration, vm_end: Duration) -> events::VmTimeline {
+    let at = |ns: u64| vm_start + Duration::from_nanos(ns.saturating_sub(finished.started_ns));
+    events::VmTimeline {
+        start: vm_start,
+        end: vm_end,
+        host: finished.marks.map(|m| events::HostMarks {
+            main: at(m.main_ns),
+            loaded: at(m.loaded_ns),
+            configured: at(m.configured_ns),
+            enter: at(m.enter_ns),
+        }),
+        helper_end: finished.helper_end_ns.map(at),
+    }
+}
+
+/// Host-side VMM spans and their `--timings` labels, in order.
+const VMM_PARTS: [(&str, &str); 5] = [
+    ("process start", "spawn"),
+    ("libkrun load", "load"),
+    ("vm configure", "configure"),
+    ("vm create", "create"),
+    ("vm teardown", "teardown"),
+];
+
 fn phase_lines(guest: &[Span], ingested: Duration, is_copy: bool, shell_form: bool) -> String {
     let sum = |name: &str| -> f64 {
         guest
@@ -314,10 +341,21 @@ fn phase_lines(guest: &[Span], ingested: Duration, is_copy: bool, shell_form: bo
             .as_secs_f64()
     };
     let main = if is_copy { "copy" } else { "command" };
+    // With the child's marks, VMM time is split into its parts.
+    let parts = VMM_PARTS.map(|(name, label)| (label, sum(name)));
+    let marked = guest
+        .iter()
+        .any(|s| VMM_PARTS.iter().any(|(n, _)| s.name == *n));
+    let vmm = sum("vmm setup") + parts.iter().map(|(_, d)| d).sum::<f64>();
+    let vmm = if marked {
+        let detail: Vec<String> = parts.iter().map(|(l, d)| format!("{l} {d:.2}")).collect();
+        format!("{vmm:.2}s ({})", detail.join(" · "))
+    } else {
+        format!("{vmm:.2}s")
+    };
     let mut out = format!(
-        "  kernel boot {:.2}s · vmm {:.2}s · unpack {:.2}s · {main} {:.2}s · commit {:.2}s · ingest {:.2}s\n",
+        "  kernel boot {:.2}s · vmm {vmm} · unpack {:.2}s · {main} {:.2}s · commit {:.2}s · ingest {:.2}s\n",
         sum("kernel boot"),
-        sum("vmm setup"),
         sum("unpack"),
         sum(main),
         sum("commit"),
@@ -393,6 +431,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vmm_figure_lists_its_parts_when_marked() {
+        let guest = [
+            span("process start", 10),
+            span("libkrun load", 40),
+            span("vm configure", 5),
+            span("vm create", 30),
+            span("vm teardown", 15),
+            span("command", 3000),
+        ];
+        let out = phase_lines(&guest, Duration::ZERO, false, false);
+        assert!(
+            out.contains(
+                "vmm 0.10s (spawn 0.01 · load 0.04 · configure 0.01 · create 0.03 · teardown 0.01)"
+            ),
+            "{out}"
+        );
+    }
+
     /// Guest events of a step whose VM ran from 100ms to 300ms on the host
     /// clock, with `cmds` as `(text, start_us)`.
     fn step_events(cmds: &[(&str, u64)]) -> (Vec<Span>, events::GuestEvents) {
@@ -409,8 +466,10 @@ mod tests {
         }
         input.push_str("{\"type\":\"end\",\"at_us\":12000}\n");
         let ev = events::parse(input.as_bytes());
-        let guest =
-            events::guest_spans(&ev, Duration::from_millis(100), Duration::from_millis(300));
+        let guest = events::guest_spans(
+            &ev,
+            &events::VmTimeline::new(Duration::from_millis(100), Duration::from_millis(300)),
+        );
         (guest, ev)
     }
 

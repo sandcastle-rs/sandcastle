@@ -14,7 +14,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use sandcastle_proto::{JOB_FILE, Job, SHARE_BLOBS, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status};
@@ -25,6 +25,10 @@ use crate::store::Store;
 
 /// VM description the parent writes into the job dir for the `__vm` child.
 pub const SPEC_FILE: &str = "vm.json";
+/// Timestamps the `__vm` child records while it starts the VM.
+pub const MARKS_FILE: &str = "vm-marks.json";
+/// Largest marks file read back from the job directory.
+const MAX_MARKS_BYTES: u64 = 4096;
 /// The parent's pid, so the child can tell whether it outlived it.
 pub const PARENT_PID_ENV: &str = "SANDCASTLE_PARENT_PID";
 /// Largest `status.json` read from the guest.
@@ -87,6 +91,10 @@ impl Vm<'_> {
             dir: self.store.new_job_dir()?,
             started: Instant::now(),
             ended: Instant::now(),
+            started_ns: 0,
+            ended_ns: 0,
+            marks: None,
+            helper_end_ns: None,
         };
         let out_dir = finished.out_dir();
         fs::write(out_dir.join(JOB_FILE), serde_json::to_vec(job)?)?;
@@ -121,6 +129,7 @@ impl Vm<'_> {
 
         // libkrun dlopens libkrunfw by bare file name; point the loader at the bundle.
         finished.started = Instant::now();
+        finished.started_ns = unix_ns();
         let exit = Command::new(self.exe)
             .arg("__vm")
             .arg(&finished.dir)
@@ -129,6 +138,9 @@ impl Vm<'_> {
             .status()
             .with_context(|| format!("starting {}", self.exe.display()))?;
         finished.ended = Instant::now();
+        finished.ended_ns = unix_ns();
+        finished.marks = read_marks(&finished.dir.join(MARKS_FILE));
+        finished.helper_end_ns = modified_ns(&out_dir.join(STATUS_FILE));
         let status = read_status(&out_dir.join(STATUS_FILE))?;
         finished.status = outcome(exit.code(), status)?;
         Ok(finished)
@@ -142,7 +154,58 @@ pub struct Finished {
     /// When the VM process was spawned and when it exited.
     pub started: Instant,
     pub ended: Instant,
+    /// The same two moments on the wall clock, which the `__vm` child and
+    /// the host's file timestamps share.
+    pub started_ns: u64,
+    pub ended_ns: u64,
+    /// When the child loaded libkrun, configured it and entered the VM.
+    pub marks: Option<VmMarks>,
+    /// When the guest last wrote `status.json`, stamped by libkrun's
+    /// virtio-fs server on the host: the end of the guest helper.
+    pub helper_end_ns: Option<u64>,
     dir: PathBuf,
+}
+
+/// Wall-clock nanoseconds since the Unix epoch at four points of the `__vm`
+/// child's start-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmMarks {
+    /// `main` entered.
+    pub main_ns: u64,
+    /// libkrun and libkrunfw loaded.
+    pub loaded_ns: u64,
+    /// libkrun configured and the Landlock sandbox applied.
+    pub configured_ns: u64,
+    /// Just before `krun_start_enter`.
+    pub enter_ns: u64,
+}
+
+pub fn unix_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// The child's marks, or `None` if it wrote none (it failed before the VM
+/// started) or wrote something unreadable. Timing only; never an error.
+fn read_marks(path: &Path) -> Option<VmMarks> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_MARKS_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Modification time of a regular file, without following links.
+fn modified_ns(path: &Path) -> Option<u64> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let d = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    u64::try_from(d.as_nanos()).ok()
 }
 
 impl Finished {

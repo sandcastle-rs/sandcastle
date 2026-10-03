@@ -1,14 +1,15 @@
 //! The `sandcastle __vm <job_dir>` process: configures libkrun and enters the VM.
 
 use std::convert::Infallible;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
 use sandcastle_proto::GUEST_HELPER_PATH;
 
 use super::krun::Krun;
-use super::{SPEC_FILE, VmSpec};
+use super::{MARKS_FILE, SPEC_FILE, VmMarks, VmSpec, unix_ns};
 
 /// Never returns on success (libkrun exits the process with the guest's code).
 pub fn enter(job_dir: &Path) -> anyhow::Error {
@@ -19,11 +20,15 @@ pub fn enter(job_dir: &Path) -> anyhow::Error {
 }
 
 fn try_enter(job_dir: &Path) -> Result<Infallible> {
+    let main_ns = unix_ns();
     #[cfg(target_os = "linux")]
     die_with_parent()?;
     raise_fd_limit();
+    // Opened before Landlock, which forbids creating files afterwards.
+    let mut marks_file = File::create(job_dir.join(MARKS_FILE)).ok();
     let spec: VmSpec = serde_json::from_slice(&fs::read(job_dir.join(SPEC_FILE))?)?;
     let krun = Krun::load(&spec.lib_dir)?;
+    let loaded_ns = unix_ns();
     krun.set_log_level_error()?;
     let mut ctx = krun.create_ctx()?;
     ctx.set_vm_config(spec.vcpus, spec.ram_mib)?;
@@ -36,6 +41,17 @@ fn try_enter(job_dir: &Path) -> Result<Infallible> {
     ctx.set_exec(GUEST_HELPER_PATH, &[], &["HOME=/"])?;
     #[cfg(target_os = "linux")]
     super::landlock::restrict(&spec)?;
+    let configured_ns = unix_ns();
+    if let Some(file) = marks_file.as_mut() {
+        let marks = VmMarks {
+            main_ns,
+            loaded_ns,
+            configured_ns,
+            enter_ns: unix_ns(),
+        };
+        // Timing only: a failed write just means no breakdown for this step.
+        let _ = file.write_all(&serde_json::to_vec(&marks)?);
+    }
     Err(ctx.start_enter())
 }
 

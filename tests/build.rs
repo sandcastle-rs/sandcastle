@@ -284,7 +284,17 @@ fn timings_and_trace_show_guest_phases() {
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("[2/2] done in "), "{stderr}");
-    for phase in ["kernel boot", "vmm", "command", "commit", "ingest"] {
+    for phase in [
+        "kernel boot",
+        "vmm",
+        "(spawn ",
+        "· load ",
+        "· create ",
+        "· teardown ",
+        "command",
+        "commit",
+        "ingest",
+    ] {
         assert!(stderr.contains(phase), "{phase} missing: {stderr}");
     }
     assert!(stderr.contains("Steps by duration:"), "{stderr}");
