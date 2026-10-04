@@ -2,15 +2,19 @@
 //! as if each root were `/`. Uses only std, so the rules test on any host.
 
 use std::ffi::OsString;
-use std::fs::{self, File, FileTimes, Metadata, Permissions};
+use std::fs::{self, File, FileTimes, FileType, Metadata, Permissions};
 use std::io::{self, ErrorKind};
-use std::os::unix::fs::{MetadataExt, PermissionsExt, lchown, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, fchown, lchown, symlink};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
 
 /// Most symlinks followed while resolving one path (Linux's MAXSYMLINKS).
 const MAX_LINKS: usize = 40;
+/// Files created but not yet filled, at most; each holds an open descriptor.
+const MAX_PENDING: usize = 512;
 
 /// Resolves `path` inside `root` as if `root` were `/`: `..` stops at the
 /// root and absolute link targets restart from it. Components that do not
@@ -223,10 +227,11 @@ impl Copy<'_> {
         }
         let into_dir = dest.ends_with('/') || dest == "." || dest.ends_with("/.") || srcs.len() > 1;
         let target = resolve_in_root(self.root, &Path::new(self.workdir).join(dest))?;
+        let mut pending = Vec::new();
         for (src, name) in &srcs {
             if fs::metadata(src)?.is_dir() {
                 self.mkdir_p(&target)?;
-                self.copy_children(src, &target)?;
+                self.copy_children(src, &target, &mut pending)?;
             } else {
                 let file_dest = if into_dir || target.is_dir() {
                     self.mkdir_p(&target)?;
@@ -236,10 +241,11 @@ impl Copy<'_> {
                     self.mkdir_p(target.parent().context("destination has no parent")?)?;
                     target.clone()
                 };
-                self.copy_entry(src, &file_dest)?;
+                let ft = fs::symlink_metadata(src)?.file_type();
+                self.copy_entry(src, &file_dest, ft, &mut pending)?;
             }
         }
-        Ok(())
+        self.fill(pending)
     }
 
     /// Creates the step's working directory like `mkdir -p`.
@@ -270,20 +276,34 @@ impl Copy<'_> {
         Ok(())
     }
 
-    fn copy_children(&self, src_dir: &Path, dest_dir: &Path) -> Result<()> {
-        let mut names: Vec<OsString> = fs::read_dir(src_dir)?
-            .map(|e| e.map(|e| e.file_name()))
+    fn copy_children(
+        &self,
+        src_dir: &Path,
+        dest_dir: &Path,
+        pending: &mut Vec<Fill>,
+    ) -> Result<()> {
+        // The entry's own type, without a stat per file over virtio-fs.
+        let mut entries: Vec<(OsString, FileType)> = fs::read_dir(src_dir)?
+            .map(|e| e.and_then(|e| Ok((e.file_name(), e.file_type()?))))
             .collect::<io::Result<_>>()?;
-        names.sort();
-        for name in names {
-            self.copy_entry(&src_dir.join(&name), &dest_dir.join(&name))?;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, ft) in entries {
+            self.copy_entry(&src_dir.join(&name), &dest_dir.join(&name), ft, pending)?;
         }
         Ok(())
     }
 
-    fn copy_entry(&self, src: &Path, dst: &Path) -> Result<()> {
-        let meta = fs::symlink_metadata(src)?;
-        let ft = meta.file_type();
+    /// Creates `dst` like `src`. Regular files are created empty and queued
+    /// in `pending`, which [`Self::fill`] copies in parallel: reading the
+    /// context costs a virtio-fs round trip per request, and one at a time
+    /// those dominate a COPY of many small files.
+    fn copy_entry(
+        &self,
+        src: &Path,
+        dst: &Path,
+        ft: FileType,
+        pending: &mut Vec<Fill>,
+    ) -> Result<()> {
         let mut created = true;
         let mut dst = dst.to_path_buf();
         match fs::symlink_metadata(&dst) {
@@ -313,16 +333,20 @@ impl Copy<'_> {
             if created {
                 fs::create_dir(&dst)?;
             }
-            self.copy_children(src, &dst)?;
+            self.copy_children(src, &dst, pending)?;
             if created {
-                self.finish(&dst, &meta)?;
+                // Filling the files later leaves the directory's mtime alone.
+                self.finish(&dst, &fs::symlink_metadata(src)?)?;
             }
         } else if ft.is_file() {
-            let mut from = File::open(src)?;
-            let mut to = File::create_new(&dst)?;
-            io::copy(&mut from, &mut to).with_context(|| format!("copying {}", src.display()))?;
-            drop(to);
-            self.finish(&dst, &meta)?;
+            let to = File::create_new(&dst)?;
+            pending.push(Fill {
+                src: src.to_path_buf(),
+                to,
+            });
+            if pending.len() >= MAX_PENDING {
+                self.fill(std::mem::take(pending))?;
+            }
         } else if ft.is_symlink() {
             symlink(fs::read_link(src)?, &dst)?;
             self.chown(&dst)?;
@@ -330,6 +354,44 @@ impl Copy<'_> {
             eprintln!("sandcastle-guest: skipping special file {}", src.display());
         }
         Ok(())
+    }
+
+    /// Copies the queued files' data and metadata, one worker per CPU. A
+    /// replaced entry's descriptor still points at the unlinked file, so a
+    /// later entry for the same path wins as it would copying in order.
+    fn fill(&self, pending: Vec<Fill>) -> Result<()> {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(pending.len());
+        if threads <= 1 {
+            return pending.into_iter().try_for_each(|f| f.run(self.owner));
+        }
+        let jobs = Mutex::new(pending.into_iter());
+        let failed = AtomicBool::new(false);
+        let error = Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while !failed.load(Ordering::Relaxed) {
+                        let Some(job) = jobs.lock().unwrap_or_else(|e| e.into_inner()).next()
+                        else {
+                            return;
+                        };
+                        if let Err(e) = job.run(self.owner) {
+                            failed.store(true, Ordering::Relaxed);
+                            error
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_or_insert(e);
+                        }
+                    }
+                });
+            }
+        });
+        match error.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Owner first (chown clears setuid bits), then mtime, then mode.
@@ -352,6 +414,30 @@ impl Copy<'_> {
             .join(path.strip_prefix(self.root).unwrap_or(path))
             .display()
             .to_string()
+    }
+}
+
+/// A regular file created by the walk, waiting for its data.
+struct Fill {
+    src: PathBuf,
+    to: File,
+}
+
+impl Fill {
+    /// Owner first (chown clears setuid bits), then mtime, then mode.
+    fn run(mut self, owner: Option<(u32, u32)>) -> Result<()> {
+        let mut from = File::open(&self.src)?;
+        let meta = from.metadata()?;
+        io::copy(&mut from, &mut self.to)
+            .with_context(|| format!("copying {}", self.src.display()))?;
+        if let Some((uid, gid)) = owner {
+            fchown(&self.to, Some(uid), Some(gid))?;
+        }
+        self.to
+            .set_times(FileTimes::new().set_modified(meta.modified()?))?;
+        self.to
+            .set_permissions(Permissions::from_mode(meta.mode() & 0o7777))?;
+        Ok(())
     }
 }
 
@@ -551,6 +637,57 @@ mod tests {
             format!("{err:#}").contains("*.rs: no files in the build context match"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn a_later_source_wins_for_the_same_destination() {
+        let f = fixture();
+        for (dir, body) in [("a", "first"), ("b", "second")] {
+            fs::create_dir(f.ctx.join(dir)).unwrap();
+            fs::write(f.ctx.join(dir).join("same.txt"), body).unwrap();
+        }
+        fs::create_dir_all(f.ctx.join("c/same.txt")).unwrap();
+        copy(&f, "/")
+            .run(&["a".into(), "b".into()], "/out/")
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(f.root.join("out/same.txt")).unwrap(),
+            "second"
+        );
+        // A directory replaces a file queued earlier in the same COPY.
+        copy(&f, "/")
+            .run(&["a".into(), "c".into()], "/dir/")
+            .unwrap();
+        assert!(f.root.join("dir/same.txt").is_dir());
+    }
+
+    #[test]
+    fn many_files_keep_their_data_and_metadata() {
+        let f = fixture();
+        let many = f.ctx.join("many");
+        fs::create_dir(&many).unwrap();
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        let n = MAX_PENDING * 2 + 7;
+        for i in 0..n {
+            let path = many.join(format!("f{i:04}"));
+            fs::write(&path, format!("file {i}")).unwrap();
+            fs::set_permissions(&path, Permissions::from_mode(0o600 + (i as u32 % 2) * 0o40))
+                .unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+        copy(&f, "/").run(&["many".into()], "/many").unwrap();
+        for i in 0..n {
+            let path = f.root.join(format!("many/f{i:04}"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("file {i}"));
+            let meta = fs::metadata(&path).unwrap();
+            assert_eq!(meta.mode() & 0o7777, 0o600 + (i as u32 % 2) * 0o40, "{i}");
+            assert_eq!(meta.modified().unwrap(), mtime, "{i}");
+        }
     }
 
     #[test]
