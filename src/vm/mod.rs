@@ -25,6 +25,11 @@ use crate::store::Store;
 
 /// VM description the parent writes into the job dir for the `__vm` child.
 pub const SPEC_FILE: &str = "vm.json";
+/// Directory to save each build step's guest kernel log into
+/// (`step-<n>.kmsg`), for diagnosing VM boot time.
+pub const DEBUG_KMSG_ENV: &str = "SANDCASTLE_DEBUG_KMSG";
+/// Extra guest kernel boot parameters, space separated, for experiments.
+pub const DEBUG_KERNEL_ARGS_ENV: &str = "SANDCASTLE_DEBUG_KERNEL_ARGS";
 /// Timestamps the `__vm` child records while it starts the VM.
 pub const MARKS_FILE: &str = "vm-marks.json";
 /// Largest marks file read back from the job directory.

@@ -266,6 +266,38 @@ fn unknown_user_fails_step() {
 
 #[test]
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn debug_kmsg_saves_the_guest_kernel_log() {
+    let ctx = tempfile::tempdir().unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    std::fs::write(
+        &dockerfile,
+        "FROM mirror.gcr.io/library/alpine:3.20\nRUN true\n",
+    )
+    .unwrap();
+    let logs = ctx.path().join("kmsg");
+    let bin = PathBuf::from(std::env::var_os("SANDCASTLE_BIN").expect("SANDCASTLE_BIN"));
+    let output = Command::new(&bin)
+        .args(["build", "-t", "demo", "-o"])
+        .arg(ctx.path().join("out"))
+        .arg("-f")
+        .arg(&dockerfile)
+        .arg(ctx.path())
+        .env("SANDCASTLE_ROOT", bin.parent().unwrap().join("store"))
+        .env("SANDCASTLE_DEBUG_KMSG", &logs)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = std::fs::read_to_string(logs.join("step-2.kmsg")).unwrap();
+    // The ring buffer starts at the kernel's first message.
+    assert!(log.contains("Linux version"), "{log}");
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn timings_and_trace_show_guest_phases() {
     let ctx = tempfile::tempdir().unwrap();
     let dockerfile = ctx.path().join("Dockerfile");

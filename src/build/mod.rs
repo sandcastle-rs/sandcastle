@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use oci_spec::image::Descriptor;
-use sandcastle_proto::{CopyJob, EVENTS_FILE, Job, LAYER_FILE, RunJob};
+use sandcastle_proto::{CopyJob, EVENTS_FILE, Job, KMSG_FILE, LAYER_FILE, MAX_KMSG_BYTES, RunJob};
 
 use crate::blobs::BlobStore;
 use crate::dockerfile::{self, Step};
@@ -209,6 +209,9 @@ fn run_step(
         ),
     };
     let finished = env.vm.run(&job, ctx)?;
+    if let Some(dir) = std::env::var_os(vm::DEBUG_KMSG_ENV) {
+        save_kmsg(&finished.out_dir().join(KMSG_FILE), Path::new(&dir), n);
+    }
     let vm_start = trace.at(finished.started);
     let vm_end = trace.at(finished.ended);
     let events = match events::read(&finished.out_dir().join(EVENTS_FILE)) {
@@ -381,6 +384,23 @@ fn phase_lines(guest: &[Span], ingested: Duration, is_copy: bool, shell_form: bo
         }
     }
     out
+}
+
+/// Copies the guest kernel log of step `n` into `dir`. Diagnostics only:
+/// failures are reported and otherwise ignored.
+fn save_kmsg(src: &Path, dir: &Path, n: usize) {
+    let copy = || -> Result<()> {
+        let Some(file) = vm::open_guest_file(src)? else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(dir)?;
+        let mut dest = std::fs::File::create(dir.join(format!("step-{n}.kmsg")))?;
+        io::copy(&mut io::Read::take(file, MAX_KMSG_BYTES), &mut dest)?;
+        Ok(())
+    };
+    if let Err(e) = copy() {
+        eprintln!("sandcastle: warning: could not save the kernel log of step {n}: {e:#}");
+    }
 }
 
 /// Gzips the guest's layer tar into the blob store and checks that the
