@@ -9,7 +9,6 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, bail, ensure};
 use flate2::Compression;
-use flate2::write::GzEncoder;
 use oci_spec::image::{
     Arch, ConfigBuilder, Descriptor, Digest, History, HistoryBuilder, ImageConfiguration,
     ImageConfigurationBuilder, ImageIndexBuilder, ImageManifestBuilder, MediaType, Os,
@@ -21,6 +20,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::blobs::{BlobStore, digest_from};
+use crate::pargz::ParGzEncoder;
 
 /// Output buffer for compressed layer bytes.
 const LAYER_BUFFER: usize = 1 << 20;
@@ -240,14 +240,19 @@ impl<W: Write> Write for Hashing<W> {
 pub struct LayerWriter<'b, 's> {
     blobs: &'b BlobStore<'s>,
     temp: NamedTempFile,
-    sink: Hashing<GzEncoder<Hashing<BufWriter<File>>>>,
+    sink: Hashing<ParGzEncoder<Hashing<BufWriter<File>>>>,
 }
 
 impl<'b, 's> LayerWriter<'b, 's> {
     pub fn new(blobs: &'b BlobStore<'s>) -> Result<Self> {
         let temp = blobs.temp()?;
         let file = BufWriter::with_capacity(LAYER_BUFFER, temp.as_file().try_clone()?);
-        let sink = Hashing::new(GzEncoder::new(Hashing::new(file), Compression::default()));
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let sink = Hashing::new(ParGzEncoder::new(
+            Hashing::new(file),
+            Compression::default(),
+            threads,
+        ));
         Ok(Self { blobs, temp, sink })
     }
 
