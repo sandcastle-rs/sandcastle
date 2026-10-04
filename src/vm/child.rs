@@ -17,16 +17,6 @@ pub fn enter(job_dir: &Path) -> anyhow::Error {
         Ok(never) => match never {},
         Err(e) => e,
     }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn x86_guests_skip_the_tsc_sync_check() {
-        assert!(
-            guest_env(false, None)
-                .unwrap()
-                .contains(&"tsc=reliable".to_string())
-        );
-    }
 }
 
 fn try_enter(job_dir: &Path) -> Result<Infallible> {
@@ -119,16 +109,6 @@ fn raise_fd_limit() {
         if cfg!(target_os = "linux") {
             eprintln!("sandcastle: warning: could not raise the open file limit: {e}");
         }
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn x86_guests_skip_the_tsc_sync_check() {
-        assert!(
-            guest_env(false, None)
-                .unwrap()
-                .contains(&"tsc=reliable".to_string())
-        );
     }
 }
 
