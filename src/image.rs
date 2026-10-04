@@ -16,7 +16,6 @@ use oci_spec::image::{
 };
 use sandcastle_proto::{LAYER_TAR, LAYER_TAR_GZIP, LowerLayer};
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::blobs::{BlobStore, digest_from};
@@ -197,10 +196,13 @@ impl ConfigState {
     }
 }
 
-/// Passes bytes through to `inner` while hashing them.
+/// Passes bytes through to `inner` while hashing them. aws-lc's SHA-256 has
+/// AVX2 assembly; `sha2` falls back to portable code on x86 CPUs without
+/// SHA extensions, about half as fast on the layers that stream through
+/// here.
 struct Hashing<W> {
     inner: W,
-    hasher: Sha256,
+    hasher: aws_lc_rs::digest::Context,
     len: u64,
 }
 
@@ -208,17 +210,15 @@ impl<W> Hashing<W> {
     fn new(inner: W) -> Self {
         Self {
             inner,
-            hasher: Sha256::new(),
+            hasher: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
             len: 0,
         }
     }
 
     fn into_parts(self) -> (W, Digest, u64) {
-        (
-            self.inner,
-            digest_from(&self.hasher.finalize().into()),
-            self.len,
-        )
+        let hash = self.hasher.finish();
+        let hash: &[u8; 32] = hash.as_ref().try_into().expect("SHA-256 is 32 bytes");
+        (self.inner, digest_from(hash), self.len)
     }
 }
 
