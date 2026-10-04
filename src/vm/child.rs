@@ -62,23 +62,41 @@ fn try_enter(job_dir: &Path) -> Result<Infallible> {
     Err(ctx.start_enter())
 }
 
-/// Guest kernel boot parameters sandcastle always passes.
+/// Guest kernel boot parameters sandcastle always passes; each was measured
+/// on the guest kernel log (`SANDCASTLE_DEBUG_KMSG`).
 ///
-/// `tsc=reliable` skips x86's TSC synchronization test, which otherwise runs
-/// for ~20 ms per secondary CPU while the guest boots (the bench box spent
-/// ~120 ms of every 8-vCPU step in it). KVM gives all vCPUs the host's
-/// synchronized TSC, and a build-step VM lives for well under a second.
+/// - `initcall_blacklist=jent_mod_init` skips the jitter entropy self-test
+///   (~10 ms). The guest RNG is still seeded by virtio-rng and the CPU; only
+///   the kernel crypto DRBG loses an extra seed source, which outside FIPS
+///   mode it does without.
+/// - `swiotlb=noforce` drops the DMA bounce buffer (64 MiB once guest RAM
+///   crosses 4 GiB, ~45 ms to set up on x86). Our devices are all virtio
+///   without `VIRTIO_F_ACCESS_PLATFORM`, so nothing bounces.
+const KERNEL_ARGS: &[&str] = &["initcall_blacklist=jent_mod_init", "swiotlb=noforce"];
+
+/// x86_64 only, on top of [`KERNEL_ARGS`]:
+///
+/// - `tsc=reliable` skips the TSC synchronization test, which otherwise runs
+///   for ~20 ms per secondary CPU while the guest boots (the bench box spent
+///   ~120 ms of every 8-vCPU step in it). KVM gives all vCPUs the host's
+///   synchronized TSC, and a build-step VM lives for well under a second.
+/// - `pci=off` skips probing for PCI, which the VM does not have (~4 ms).
 #[cfg(target_arch = "x86_64")]
-const KERNEL_ARGS: &[&str] = &["tsc=reliable"];
+const ARCH_KERNEL_ARGS: &[&str] = &["tsc=reliable", "pci=off"];
 #[cfg(not(target_arch = "x86_64"))]
-const KERNEL_ARGS: &[&str] = &[];
+const ARCH_KERNEL_ARGS: &[&str] = &[];
 
 /// The guest helper's environment. libkrun writes each entry, in double
 /// quotes, onto the guest kernel's command line; the kernel takes the ones
 /// it knows as boot parameters, which is how `kernel_args` reach it.
 fn guest_env(kmsg: bool, kernel_args: Option<&str>) -> Result<Vec<String>> {
     let mut env = vec!["HOME=/".to_string()];
-    env.extend(KERNEL_ARGS.iter().map(|a| a.to_string()));
+    env.extend(
+        KERNEL_ARGS
+            .iter()
+            .chain(ARCH_KERNEL_ARGS)
+            .map(|a| a.to_string()),
+    );
     if kmsg {
         env.push(format!("{KMSG_ENV}=1"));
     }
@@ -138,7 +156,7 @@ mod tests {
     fn guest_env_carries_debug_flags_and_kernel_args() {
         let base: Vec<&str> = ["HOME=/"]
             .into_iter()
-            .chain(KERNEL_ARGS.iter().copied())
+            .chain(KERNEL_ARGS.iter().chain(ARCH_KERNEL_ARGS).copied())
             .collect();
         assert_eq!(guest_env(false, None).unwrap(), base);
         let mut debug = base.clone();

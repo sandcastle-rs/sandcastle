@@ -294,6 +294,9 @@ fn debug_kmsg_saves_the_guest_kernel_log() {
     let log = std::fs::read_to_string(logs.join("step-2.kmsg")).unwrap();
     // The ring buffer starts at the kernel's first message.
     assert!(log.contains("Linux version"), "{log}");
+    // The default kernel arguments took effect.
+    assert!(log.contains("initcall jent_mod_init blacklisted"), "{log}");
+    assert!(!log.contains("software IO TLB: mapped"), "{log}");
 }
 
 #[test]
