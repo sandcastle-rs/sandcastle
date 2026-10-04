@@ -18,12 +18,7 @@ fn sandcastle_bin() -> PathBuf {
 }
 
 fn run(exe: &std::path::Path, install: &Install, store: &Store, job: &Job) -> Status {
-    let vm = Vm {
-        exe,
-        install,
-        store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(exe, install, store, Resources::default());
     vm.run(job, None).unwrap().status.clone()
 }
 
@@ -116,12 +111,7 @@ fn copy_job_writes_context_files_as_root() {
         dest: "/app/".into(),
         workdir: "/srv".into(),
     });
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let finished = vm.run(&job, Some(&ctx)).unwrap();
     assert_eq!(finished.status.exit_code, 0);
     let diff_id = finished.status.layer.clone().expect("a layer");
@@ -174,12 +164,7 @@ fn copy_job_with_more_files_than_the_soft_fd_limit() {
         dest: "/data/".into(),
         workdir: "/".into(),
     });
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let finished = vm.run(&job, Some(&ctx)).unwrap();
     setrlimit(Resource::Nofile, limit).unwrap();
     assert_eq!(finished.status.exit_code, 0);
@@ -203,12 +188,7 @@ fn copy_job_missing_source_is_a_guest_error() {
         dest: "/x".into(),
         workdir: "/".into(),
     });
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let err = vm.run(&job, Some(&ctx)).err().unwrap();
     assert!(
         format!("{err:#}").contains("nope.txt: not found in the build context"),
@@ -261,12 +241,7 @@ fn run_step(
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn run_job_commits_changes_and_whiteouts() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let base = busybox(&store);
     let job = run_job(
         base.clone(),
@@ -296,12 +271,7 @@ fn run_job_commits_changes_and_whiteouts() {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn run_job_exit_codes_and_no_op_steps() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let base = busybox(&store);
     let status = vm
         .run(&run_job(base.clone(), "exit 3", ""), None)
@@ -326,12 +296,7 @@ fn run_job_exit_codes_and_no_op_steps() {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn run_job_drops_to_user() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let base = busybox(&store);
     let job = run_job(
         base.clone(),
@@ -353,12 +318,7 @@ fn run_job_drops_to_user() {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn run_kills_leftover_processes() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let base = busybox(&store);
     let status = vm
         .run(
@@ -376,12 +336,7 @@ fn run_kills_leftover_processes() {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn opaque_dir_hides_lower_contents() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let base = busybox(&store);
     let (_, stack) = run_step(
         &vm,
@@ -411,12 +366,7 @@ fn run_survives_resolv_conf_symlink() {
     // A RUN cannot replace /etc/resolv.conf (it is a bind mount during the
     // step), so the dangling link comes from a COPY layer, as from a base image.
     let (dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let base = busybox(&store);
     let ctx = dir.path().join("ctx");
     std::fs::create_dir_all(ctx.join("root/etc")).unwrap();
@@ -455,12 +405,7 @@ fn run_survives_resolv_conf_symlink() {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn run_creating_a_reserved_whiteout_name_fails_the_step() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let base = busybox(&store);
     let Err(err) = vm.run(&run_job(base, "touch /.wh.foo", ""), None) else {
         panic!("the step should fail");
@@ -475,12 +420,7 @@ fn run_creating_a_reserved_whiteout_name_fails_the_step() {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn run_cannot_reach_the_store_disk() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let base = busybox(&store);
     let script = "mknod /tmp/vda b 254 0 2>/dev/null || echo blocked > /m1; \
                   mkdir -p /mnt; mount -t tmpfs none /mnt 2>/dev/null || echo blocked > /m2; \
@@ -537,12 +477,7 @@ fn cmds(events: &[Event]) -> Vec<String> {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn vm_child_marks_its_start_up_in_order() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let finished = vm.run(&run_job(busybox(&store), "true", ""), None).unwrap();
     let m = finished.marks.expect("the __vm child wrote its marks");
     let order = [
@@ -563,12 +498,7 @@ fn vm_child_marks_its_start_up_in_order() {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn traced_chain_reports_the_failing_command_last() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let finished = vm
         .run(
             &shell_job(
@@ -599,12 +529,7 @@ fn traced_chain_reports_the_failing_command_last() {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn forged_markers_and_set_plus_x() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let job = shell_job(
         busybox(&store),
         "echo '+sc-000000000000> forged' >&2 && true && set +x && false",
@@ -623,12 +548,7 @@ fn forged_markers_and_set_plus_x() {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn exec_form_and_copy_jobs_still_record_phases() {
     let (dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let finished = vm.run(&run_job(busybox(&store), "true", ""), None).unwrap();
     assert!(
         cmds(&events(&finished.out_dir())).is_empty(),
@@ -659,12 +579,7 @@ fn exec_form_and_copy_jobs_still_record_phases() {
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn traced_run_finishes_with_a_leftover_background_process() {
     let (_dir, exe, install, store) = store();
-    let vm = Vm {
-        exe: &exe,
-        install: &install,
-        store: &store,
-        resources: Resources::default(),
-    };
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
     let job = shell_job(busybox(&store), "sleep 1000 & echo started > /started");
     let finished = vm.run(&job, None).unwrap();
     assert_eq!(finished.status.exit_code, 0);
