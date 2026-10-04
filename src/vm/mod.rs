@@ -9,6 +9,7 @@ pub mod child;
 pub mod krun;
 #[cfg(target_os = "linux")]
 pub mod landlock;
+mod wait;
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -20,6 +21,7 @@ use anyhow::{Context, Result, bail, ensure};
 use sandcastle_proto::{JOB_FILE, Job, SHARE_BLOBS, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status};
 use serde::{Deserialize, Serialize};
 
+use self::wait::{Children, Ended};
 use crate::install::Install;
 use crate::store::Store;
 
@@ -80,12 +82,32 @@ impl Default for Resources {
 }
 
 /// Runs guest jobs. `exe` is the signed `sandcastle` binary used for the
-/// `__vm` child.
+/// `__vm` child. Dropping it waits for every VM process to be gone.
 pub struct Vm<'a> {
     pub exe: &'a Path,
     pub install: &'a Install,
     pub store: &'a Store,
     pub resources: Resources,
+    /// Only Linux hands VM processes over before they exit.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    children: Children,
+}
+
+impl<'a> Vm<'a> {
+    pub fn new(
+        exe: &'a Path,
+        install: &'a Install,
+        store: &'a Store,
+        resources: Resources,
+    ) -> Self {
+        Self {
+            exe,
+            install,
+            store,
+            resources,
+            children: Children::default(),
+        }
+    }
 }
 
 impl Vm<'_> {
@@ -135,19 +157,35 @@ impl Vm<'_> {
         // libkrun dlopens libkrunfw by bare file name; point the loader at the bundle.
         finished.started = Instant::now();
         finished.started_ns = unix_ns();
-        let exit = Command::new(self.exe)
+        // Without a watch (inotify limits), wait for the process to exit.
+        #[cfg(target_os = "linux")]
+        let watch = wait::StatusWatch::new(&out_dir).ok();
+        let child = Command::new(self.exe)
             .arg("__vm")
             .arg(&finished.dir)
             .env(LIB_PATH_ENV, &self.install.lib_dir)
             .env(PARENT_PID_ENV, std::process::id().to_string())
-            .status()
+            .spawn()
             .with_context(|| format!("starting {}", self.exe.display()))?;
+        #[cfg(target_os = "linux")]
+        let ended = match watch {
+            Some(watch) => watch.wait(child, &self.children)?,
+            None => wait::wait(child)?,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let ended = wait::wait(child)?;
         finished.ended = Instant::now();
         finished.ended_ns = unix_ns();
         finished.marks = read_marks(&finished.dir.join(MARKS_FILE));
         finished.helper_end_ns = modified_ns(&out_dir.join(STATUS_FILE));
         let status = read_status(&out_dir.join(STATUS_FILE))?;
-        finished.status = outcome(exit.code(), status)?;
+        finished.status = match ended {
+            Ended::Exited(exit) => outcome(exit.code(), status)?,
+            Ended::Committed => {
+                let status = status.context("the guest helper committed an unreadable status")?;
+                outcome(None, Some(status))?
+            }
+        };
         Ok(finished)
     }
 }

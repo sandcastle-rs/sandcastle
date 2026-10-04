@@ -110,12 +110,7 @@ fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descript
         ConfigState::from_base(&image.config, image.layers)?,
         recipe.escape,
     );
-    let vm = Vm {
-        exe,
-        install: &install,
-        store: &store,
-        resources: opts.resources,
-    };
+    let vm = Vm::new(exe, &install, &store, opts.resources);
     let resolv_conf = dns::resolv_conf();
     let env = StepEnv {
         vm: &vm,
