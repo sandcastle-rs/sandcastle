@@ -9,7 +9,6 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, bail, ensure};
 use flate2::Compression;
-use flate2::write::GzEncoder;
 use oci_spec::image::{
     Arch, ConfigBuilder, Descriptor, Digest, History, HistoryBuilder, ImageConfiguration,
     ImageConfigurationBuilder, ImageIndexBuilder, ImageManifestBuilder, MediaType, Os,
@@ -17,10 +16,10 @@ use oci_spec::image::{
 };
 use sandcastle_proto::{LAYER_TAR, LAYER_TAR_GZIP, LowerLayer};
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::blobs::{BlobStore, digest_from};
+use crate::pargz::ParGzEncoder;
 
 /// Output buffer for compressed layer bytes.
 const LAYER_BUFFER: usize = 1 << 20;
@@ -197,10 +196,13 @@ impl ConfigState {
     }
 }
 
-/// Passes bytes through to `inner` while hashing them.
+/// Passes bytes through to `inner` while hashing them. aws-lc's SHA-256 has
+/// AVX2 assembly; `sha2` falls back to portable code on x86 CPUs without
+/// SHA extensions, about half as fast on the layers that stream through
+/// here.
 struct Hashing<W> {
     inner: W,
-    hasher: Sha256,
+    hasher: aws_lc_rs::digest::Context,
     len: u64,
 }
 
@@ -208,17 +210,15 @@ impl<W> Hashing<W> {
     fn new(inner: W) -> Self {
         Self {
             inner,
-            hasher: Sha256::new(),
+            hasher: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
             len: 0,
         }
     }
 
     fn into_parts(self) -> (W, Digest, u64) {
-        (
-            self.inner,
-            digest_from(&self.hasher.finalize().into()),
-            self.len,
-        )
+        let hash = self.hasher.finish();
+        let hash: &[u8; 32] = hash.as_ref().try_into().expect("SHA-256 is 32 bytes");
+        (self.inner, digest_from(hash), self.len)
     }
 }
 
@@ -240,14 +240,19 @@ impl<W: Write> Write for Hashing<W> {
 pub struct LayerWriter<'b, 's> {
     blobs: &'b BlobStore<'s>,
     temp: NamedTempFile,
-    sink: Hashing<GzEncoder<Hashing<BufWriter<File>>>>,
+    sink: Hashing<ParGzEncoder<Hashing<BufWriter<File>>>>,
 }
 
 impl<'b, 's> LayerWriter<'b, 's> {
     pub fn new(blobs: &'b BlobStore<'s>) -> Result<Self> {
         let temp = blobs.temp()?;
         let file = BufWriter::with_capacity(LAYER_BUFFER, temp.as_file().try_clone()?);
-        let sink = Hashing::new(GzEncoder::new(Hashing::new(file), Compression::default()));
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let sink = Hashing::new(ParGzEncoder::new(
+            Hashing::new(file),
+            Compression::default(),
+            threads,
+        ));
         Ok(Self { blobs, temp, sink })
     }
 
