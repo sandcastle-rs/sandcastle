@@ -1,30 +1,137 @@
 diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
-index 72831f1..680316a 100644
+index 72831f1..739c180 100644
 --- a/src/vmm/src/builder.rs
 +++ b/src/vmm/src/builder.rs
-@@ -1512,11 +1512,25 @@ pub fn create_guest_memory(
+@@ -1341,6 +1341,21 @@ fn load_payload(
+                     return Err(StartMicrovmError::MissingKernelConfig);
+                 };
+ 
++            // The bundle lives in libkrunfw's data: file-backed 4 KiB pages
++            // the guest faults in one by one and copies on first write. A
++            // huge-page-backed copy, aligned like its guest address, lets
++            // KVM map the kernel with 2 MiB pages instead.
++            #[cfg(target_os = "linux")]
++            let kernel_host_addr = {
++                let copy = map_huge_aligned(kernel_size, kernel_guest_addr as usize)
++                    .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e}")))?;
++                // SAFETY: the bundle is `kernel_size` readable bytes, `copy` a
++                // fresh mapping of at least that size; they do not overlap.
++                unsafe {
++                    std::ptr::copy_nonoverlapping(kernel_host_addr as *const u8, copy, kernel_size)
++                };
++                copy as u64
++            };
+             let kernel_region = unsafe {
+                 MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
+                     .map_err(StartMicrovmError::InvalidKernelBundle)?
+@@ -1512,10 +1527,17 @@ pub fn create_guest_memory(
              .map_err(StartMicrovmError::ShmCreate)?;
      }
  
 +    let ram_regions = arch_mem_regions.len();
      arch_mem_regions.extend(shm_manager.regions());
  
-     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
-         .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
- 
-+    // Ask for transparent huge pages on guest RAM, which hosts with THP in
-+    // "madvise" mode (the common default) otherwise back with 4 KiB pages.
-+    // The guest kernel initializes its page metadata across all of RAM at
-+    // boot, so every 4 KiB host fault there adds up to milliseconds per GiB.
+-    let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
+-        .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
 +    #[cfg(target_os = "linux")]
-+    for &(start, len) in &arch_mem_regions[..ram_regions] {
-+        if let Ok(addr) = vm_memory::GuestMemory::get_host_address(&guest_mem, start) {
-+            // SAFETY: `addr..addr + len` is one region `guest_mem` mapped above.
-+            // The advice is a hint; on failure the region keeps small pages.
-+            unsafe { libc::madvise(addr.cast(), len, libc::MADV_HUGEPAGE) };
-+        }
-+    }
-+
++    let guest_mem = hugepage_guest_memory(&arch_mem_regions, ram_regions)?;
++    #[cfg(not(target_os = "linux"))]
++    let guest_mem = {
++        let _ = ram_regions;
++        GuestMemoryMmap::from_ranges(&arch_mem_regions)
++            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
++    };
+ 
      let (guest_mem, entry_addr, initrd_config, cmdline) =
          load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
- 
+@@ -2503,3 +2525,90 @@ pub mod tests {
+         let _ = format!("{err}{err:?}");
+     }
+ }
++
++/// Size of a huge page, the alignment KVM needs to map guest memory with
++/// 2 MiB pages.
++#[cfg(target_os = "linux")]
++const HUGE_PAGE: usize = 2 << 20;
++
++/// Maps guest memory so each range's host address has the same offset
++/// within 2 MiB as its guest address. KVM maps a range with 2 MiB pages only
++/// then; otherwise every 4 KiB page costs the guest an exit on first touch.
++/// Guest RAM also asks for transparent huge pages, which hosts with THP in
++/// "madvise" mode (the common default) otherwise do not give it.
++#[cfg(target_os = "linux")]
++fn hugepage_guest_memory(
++    ranges: &[(GuestAddress, usize)],
++    ram_regions: usize,
++) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
++    let err = |e: String| StartMicrovmError::GuestMemoryMmap(e);
++    let mut regions = Vec::with_capacity(ranges.len());
++    for (i, &(start, size)) in ranges.iter().enumerate() {
++        let host = if i < ram_regions {
++            map_huge_aligned(size, start.raw_value() as usize)
++        } else {
++            map_aligned(size, start.raw_value() as usize)
++        }
++        .map_err(|e| err(format!("{e}")))?;
++        let prot = libc::PROT_READ | libc::PROT_WRITE;
++        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
++        // SAFETY: `host..host + size` was mapped above with `prot` and
++        // `flags` and is never unmapped.
++        let mapping = unsafe { vm_memory::mmap::MmapRegion::build_raw(host, size, prot, flags) }
++            .map_err(|e| err(format!("{e:?}")))?;
++        regions.push(
++            vm_memory::GuestRegionMmap::new(mapping, start)
++                .ok_or_else(|| err("Failed to create GuestRegionMmap".to_string()))?,
++        );
++    }
++    GuestMemoryMmap::from_regions(regions).map_err(|e| err(format!("{e:?}")))
++}
++
++/// Like [`map_aligned`], backed by transparent huge pages where the host
++/// allows them.
++#[cfg(target_os = "linux")]
++fn map_huge_aligned(size: usize, guest_addr: usize) -> std::io::Result<*mut u8> {
++    let host = map_aligned(size, guest_addr)?;
++    // SAFETY: `host..host + size` is the mapping just made. The advice is a
++    // hint; on failure the memory keeps small pages.
++    unsafe { libc::madvise(host.cast(), size, libc::MADV_HUGEPAGE) };
++    Ok(host)
++}
++
++/// Anonymous memory of at least `size` bytes whose address has the same
++/// offset within 2 MiB as `guest_addr`. It is never unmapped.
++#[cfg(target_os = "linux")]
++fn map_aligned(size: usize, guest_addr: usize) -> std::io::Result<*mut u8> {
++    let page = 4096;
++    let size = size.next_multiple_of(page);
++    let offset = guest_addr % HUGE_PAGE;
++    let len = size + HUGE_PAGE;
++    // SAFETY: a fresh anonymous mapping; no existing memory is touched.
++    let base = unsafe {
++        libc::mmap(
++            std::ptr::null_mut(),
++            len,
++            libc::PROT_READ | libc::PROT_WRITE,
++            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
++            -1,
++            0,
++        )
++    };
++    if base == libc::MAP_FAILED {
++        return Err(std::io::Error::last_os_error());
++    }
++    let base = base as usize;
++    let start = (base - offset).next_multiple_of(HUGE_PAGE) + offset;
++    let end = start + size;
++    // SAFETY: both pieces lie inside the mapping made above, outside
++    // `start..end`, and are page aligned.
++    unsafe {
++        if start > base {
++            libc::munmap(base as *mut libc::c_void, start - base);
++        }
++        if base + len > end {
++            libc::munmap(end as *mut libc::c_void, base + len - end);
++        }
++    }
++    Ok(start as *mut u8)
++}
