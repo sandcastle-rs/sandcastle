@@ -96,12 +96,23 @@ esac
 # (lazy_*_init=0) so the guest kernel never zeroes them later and inflates
 # the sparse file; pack-sparse.py drops the zero chunks again.
 dd if=/dev/zero of="$work/store.ext4" bs=1 count=0 seek="$STORE_DISK_BYTES" 2>/dev/null
+mkfs() {
+    "$mke2fs" -q -F -t ext4 -m 0 -E "lazy_itable_init=0,lazy_journal_init=0,nodiscard$1" "$work/store.ext4"
+}
 # The guest reads the whole orphan file, block by block, at every mount;
-# mke2fs sizes it by version (2 blocks on 1.47.4, 512 on 1.47.2, ~23 ms per
-# step), so pin it to 16 blocks. A bare number is not taken as bytes.
-"$mke2fs" -q -F -t ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,nodiscard,orphan_file_size=64k "$work/store.ext4"
-"$debugfs" -R "stat <12>" "$work/store.ext4" 2>/dev/null | grep -q 'Size: 65536$' ||
-    { echo "store template: orphan file is not 64 KiB" >&2; exit 1; }
+# mke2fs >= 1.47 sizes it by version (2 blocks on 1.47.4, 512 on 1.47.2,
+# ~23 ms per step), so pin it to 16 blocks. A bare number is not taken as
+# bytes. Older mke2fs has no orphan file and rejects the option.
+if mkfs ,orphan_file_size=64k 2>/dev/null; then
+    "$debugfs" -R "stat <12>" "$work/store.ext4" 2>/dev/null | grep -q 'Size: 65536$' ||
+        { echo "store template: orphan file is not 64 KiB" >&2; exit 1; }
+else
+    mkfs ""
+    if "$debugfs" -R features "$work/store.ext4" 2>/dev/null | grep -qw orphan_file; then
+        echo "store template: mke2fs made an orphan file it could not size" >&2
+        exit 1
+    fi
+fi
 python3 "$here/pack-sparse.py" "$work/store.ext4" | zstd -q -19 -o "$out/store-template.ext4.zst"
 
 {
