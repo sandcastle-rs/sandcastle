@@ -19,7 +19,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: lib
-          key: libs-${{ matrix.platform }}-${{ hashFiles('scripts/build-libs.sh', 'scripts/libs.env', 'scripts/pack-sparse.py') }}
+          key: libs-${{ matrix.platform }}-${{ hashFiles('scripts/build-libs.sh', 'scripts/libs.env', 'scripts/pack-sparse.py', 'scripts/patches/*') }}
       - if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
         run: brew install lld xz e2fsprogs zstd
       - if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'

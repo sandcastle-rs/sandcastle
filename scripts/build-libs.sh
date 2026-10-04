@@ -52,10 +52,13 @@ Linux)
 *) echo "unsupported OS $os" >&2; exit 1 ;;
 esac
 
-# libkrun from the upstream source tag, with virtio-blk for the store disk.
+# libkrun from the upstream source tag plus patches/, with virtio-blk for the store disk.
 fetch "https://github.com/containers/libkrun/archive/refs/tags/$LIBKRUN_TAG.tar.gz" "$LIBKRUN_SRC_SHA256" "$work/krun.tgz"
 tar -xzf "$work/krun.tgz" -C "$work"
 krun_src="$work/libkrun-${LIBKRUN_TAG#v}"
+for p in "$here"/patches/libkrun-*.patch; do
+    patch -d "$krun_src" -p1 --silent < "$p"
+done
 # krun-input's bindgen build script needs libclang; macOS gets it from the
 # Xcode or the command line tools.
 if [ "$os" = Darwin ]; then
@@ -97,6 +100,9 @@ python3 "$here/pack-sparse.py" "$work/store.ext4" | zstd -q -19 -o "$out/store-t
 {
     echo "libkrun $LIBKRUN_TAG source sha256 $LIBKRUN_SRC_SHA256 (https://github.com/containers/libkrun)"
     echo "libkrunfw $LIBKRUNFW_TAG (https://github.com/containers/libkrunfw/tree/$LIBKRUNFW_TAG)"
+    for p in "$here"/patches/libkrun-*.patch; do
+        echo "libkrun patch $(basename "$p") sha256 $(shasum -a 256 "$p" | cut -d' ' -f1)"
+    done
     echo "built on $os $arch with make BLK=1"
     echo "sha256 of every bundled file: see SHA256SUMS"
 } >"$out/PROVENANCE"
