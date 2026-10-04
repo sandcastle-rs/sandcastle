@@ -79,6 +79,7 @@ Darwin)
         echo "libkrun.1.dylib links non-system libraries (listed above)" >&2; exit 1
     fi
     mke2fs="$(brew --prefix e2fsprogs)/sbin/mke2fs"
+    debugfs="$(brew --prefix e2fsprogs)/sbin/debugfs"
     ;;
 Linux)
     cp "$krun_src/target/release/libkrun.so.${LIBKRUN_TAG#v}" "$out/libkrun.so.1"
@@ -87,6 +88,7 @@ Linux)
         echo "libkrun.so.1 needs glibc $newest > $GLIBC_MAX" >&2; exit 1
     fi
     mke2fs=mke2fs
+    debugfs=debugfs
     ;;
 esac
 
@@ -94,7 +96,23 @@ esac
 # (lazy_*_init=0) so the guest kernel never zeroes them later and inflates
 # the sparse file; pack-sparse.py drops the zero chunks again.
 dd if=/dev/zero of="$work/store.ext4" bs=1 count=0 seek="$STORE_DISK_BYTES" 2>/dev/null
-"$mke2fs" -q -F -t ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,nodiscard "$work/store.ext4"
+mkfs() {
+    "$mke2fs" -q -F -t ext4 -m 0 -E "lazy_itable_init=0,lazy_journal_init=0,nodiscard$1" "$work/store.ext4"
+}
+# The guest reads the whole orphan file, block by block, at every mount;
+# mke2fs >= 1.47 sizes it by version (2 blocks on 1.47.4, 512 on 1.47.2,
+# ~23 ms per step), so pin it to 16 blocks. A bare number is not taken as
+# bytes. Older mke2fs has no orphan file and rejects the option.
+if mkfs ,orphan_file_size=64k 2>/dev/null; then
+    "$debugfs" -R "stat <12>" "$work/store.ext4" 2>/dev/null | grep -q 'Size: 65536$' ||
+        { echo "store template: orphan file is not 64 KiB" >&2; exit 1; }
+else
+    mkfs ""
+    if "$debugfs" -R features "$work/store.ext4" 2>/dev/null | grep -qw orphan_file; then
+        echo "store template: mke2fs made an orphan file it could not size" >&2
+        exit 1
+    fi
+fi
 python3 "$here/pack-sparse.py" "$work/store.ext4" | zstd -q -19 -o "$out/store-template.ext4.zst"
 
 {
