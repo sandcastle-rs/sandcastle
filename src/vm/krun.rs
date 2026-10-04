@@ -40,7 +40,6 @@ pub struct Krun {
     create_ctx: CreateCtxFn,
     set_log_level: SetLogLevelFn,
     set_vm_config: SetVmConfigFn,
-    set_root: SetPathFn,
     set_workdir: SetPathFn,
     add_disk: AddDiskFn,
     add_virtiofs: AddVirtiofsFn,
@@ -67,7 +66,6 @@ impl Krun {
                 create_ctx: symbol(&lib, c"krun_create_ctx")?,
                 set_log_level: symbol(&lib, c"krun_set_log_level")?,
                 set_vm_config: symbol(&lib, c"krun_set_vm_config")?,
-                set_root: symbol(&lib, c"krun_set_root")?,
                 set_workdir: symbol(&lib, c"krun_set_workdir")?,
                 add_disk: symbol(&lib, c"krun_add_disk")?,
                 add_virtiofs: symbol(&lib, c"krun_add_virtiofs3")?,
@@ -123,19 +121,9 @@ impl Ctx<'_> {
         .map(drop)
     }
 
-    pub fn set_root(&mut self, dir: &Path) -> Result<()> {
-        let dir = path_cstring(dir)?;
-        // SAFETY: `dir` is NUL-terminated and outlives the call; libkrun copies it.
-        check(
-            unsafe { (self.krun.set_root)(self.id, dir.as_ptr()) },
-            "krun_set_root",
-        )
-        .map(drop)
-    }
-
     pub fn set_workdir(&mut self, dir: &str) -> Result<()> {
         let dir = CString::new(dir)?;
-        // SAFETY: as in `set_root`.
+        // SAFETY: `dir` is NUL-terminated and outlives the call; libkrun copies it.
         check(
             unsafe { (self.krun.set_workdir)(self.id, dir.as_ptr()) },
             "krun_set_workdir",
@@ -152,7 +140,7 @@ impl Ctx<'_> {
         check(rc, "krun_add_disk").map(drop)
     }
 
-    /// `shm_size` 0 keeps libkrun's default DAX window.
+    /// Passes `shm_size` 0: no DAX window.
     pub fn add_virtiofs(&mut self, tag: &str, dir: &Path, read_only: bool) -> Result<()> {
         let tag = CString::new(tag)?;
         let dir = path_cstring(dir)?;
