@@ -1,5 +1,4 @@
-//! Reads a Dockerfile and checks it against what sandcastle can build
-//! today, so unsupported instructions fail before anything is pulled.
+//! Parse stage recipes and validate the instructions understood by the planner.
 
 use std::fs;
 use std::path::Path;
@@ -17,51 +16,89 @@ pub struct Step {
 }
 
 #[derive(Debug, Clone)]
-pub struct Recipe {
+pub struct StageRecipe {
+    pub name: Option<String>,
     pub base: String,
-    pub escape: char,
+    pub text: String,
+    pub line: usize,
     pub steps: Vec<Step>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Recipe {
+    pub escape: char,
+    pub stages: Vec<StageRecipe>,
 }
 
 pub fn load(path: &Path) -> Result<Recipe> {
     let src = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    check(&src).with_context(|| path.display().to_string())
+    let recipe = check(&src).with_context(|| path.display().to_string())?;
+    single_stage(&recipe).with_context(|| path.display().to_string())?;
+    Ok(recipe)
 }
 
 pub fn check(src: &str) -> Result<Recipe> {
     let dockerfile = parse(src)?;
-    let mut nodes = dockerfile.nodes.iter();
-    let first = nodes.next().context("the Dockerfile has no instructions")?;
-    let line = first.start_line;
-    let base = match Instruction::try_from(first)? {
-        Instruction::From { stage: Some(_), .. } => {
-            bail!("line {line}: multi-stage builds (FROM … AS) are not supported yet")
-        }
-        Instruction::From { flags, .. } if !flags.is_empty() => {
-            bail!("line {line}: FROM --{} is not supported yet", flags[0].name)
-        }
-        Instruction::From { image, .. } if image.eq_ignore_ascii_case("scratch") => {
-            bail!("line {line}: FROM scratch is not supported yet")
-        }
-        Instruction::From { image, .. } => image,
-        _ => bail!("line {line}: the first instruction must be FROM"),
-    };
-    let steps = nodes
-        .map(|node| {
-            let instruction = Instruction::try_from(node)?;
+    let mut stages: Vec<StageRecipe> = Vec::new();
+    for node in &dockerfile.nodes {
+        let instruction = Instruction::try_from(node)?;
+        let line = node.start_line;
+        if let Instruction::From {
+            image,
+            stage,
+            flags,
+        } = instruction
+        {
+            if let Some(flag) = flags.first() {
+                bail!("line {line}: FROM --{} is not supported yet", flag.name);
+            }
+            stages.push(StageRecipe {
+                name: stage.map(|name| name.to_ascii_lowercase()),
+                base: image,
+                text: node.original.clone(),
+                line,
+                steps: Vec::new(),
+            });
+        } else {
+            let stage = stages
+                .last_mut()
+                .with_context(|| format!("line {line}: the first instruction must be FROM"))?;
             supported(&instruction, node)?;
-            Ok(Step {
+            stage.steps.push(Step {
                 instruction,
                 text: node.original.clone(),
-                line: node.start_line,
-            })
-        })
-        .collect::<Result<_>>()?;
+                line,
+            });
+        }
+    }
     Ok(Recipe {
-        base,
         escape: dockerfile.escape,
-        steps,
+        stages,
     })
+}
+
+/// Keep execution limited to the existing builder until stage jobs are wired in.
+fn single_stage(recipe: &Recipe) -> Result<()> {
+    for (index, stage) in recipe.stages.iter().enumerate() {
+        let line = stage.line;
+        if index > 0 {
+            bail!("line {line}: multi-stage builds (a second FROM) are not supported yet");
+        }
+        if stage.name.is_some() {
+            bail!("line {line}: multi-stage builds (FROM … AS) are not supported yet");
+        }
+        if stage.base.eq_ignore_ascii_case("scratch") {
+            bail!("line {line}: FROM scratch is not supported yet");
+        }
+        for step in &stage.steps {
+            if let Instruction::Copy { flags, .. } = &step.instruction
+                && flags.iter().any(|flag| flag.name == "from")
+            {
+                bail!("line {}: COPY --from is not supported yet", step.line);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn supported(instruction: &Instruction, node: &Node) -> Result<()> {
@@ -70,7 +107,10 @@ fn supported(instruction: &Instruction, node: &Node) -> Result<()> {
         Instruction::From { .. } => {
             bail!("line {line}: multi-stage builds (a second FROM) are not supported yet")
         }
-        Instruction::Run { flags, .. } | Instruction::Copy { flags, .. } => match flags.first() {
+        Instruction::Run { flags, .. } | Instruction::Copy { flags, .. } => match flags
+            .iter()
+            .find(|flag| !matches!(instruction, Instruction::Copy { .. }) || flag.name != "from")
+        {
             Some(flag) => bail!(
                 "line {line}: {} --{} is not supported yet",
                 node.cmd.to_ascii_uppercase(),
@@ -93,7 +133,8 @@ mod tests {
     use super::*;
 
     fn err(src: &str) -> String {
-        format!("{:#}", check(src).unwrap_err())
+        let result = check(src).and_then(|recipe| single_stage(&recipe));
+        format!("{:#}", result.unwrap_err())
     }
 
     #[test]
@@ -102,11 +143,11 @@ mod tests {
             "# syntax=docker/dockerfile:1\nFROM alpine:3.20\nenv A=1\nWORKDIR /app\nCOPY a b/\nrun echo hi\nUSER 1000\nLABEL x=y\nEXPOSE 80\nCMD [\"sh\"]\nENTRYPOINT [\"/bin/sh\",\"-c\"]\n",
         )
         .unwrap();
-        assert_eq!(recipe.base, "alpine:3.20");
+        assert_eq!(recipe.stages[0].base, "alpine:3.20");
         assert_eq!(recipe.escape, '\\');
-        assert_eq!(recipe.steps.len(), 9);
-        assert_eq!(recipe.steps[3].text, "run echo hi");
-        assert_eq!(recipe.steps[3].line, 6);
+        assert_eq!(recipe.stages[0].steps.len(), 9);
+        assert_eq!(recipe.stages[0].steps[3].text, "run echo hi");
+        assert_eq!(recipe.stages[0].steps[3].line, 6);
     }
 
     #[test]
