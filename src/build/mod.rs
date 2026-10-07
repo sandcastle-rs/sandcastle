@@ -4,6 +4,7 @@
 pub mod config;
 pub mod dns;
 pub mod events;
+pub mod plan;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -81,6 +82,8 @@ fn timed<T>(trace: &mut Trace, name: &str, f: impl FnOnce() -> T) -> T {
 fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descriptor> {
     // Unsupported instructions fail here, before any download or VM.
     let recipe = timed(trace, "parse", || dockerfile::load(&opts.dockerfile))?;
+    let plan = timed(trace, "plan", || plan::resolve(&recipe, None))?;
+    let stage_recipe = &recipe.stages[plan.target];
     let context = std::fs::canonicalize(&opts.context)
         .with_context(|| format!("build context {}", opts.context.display()))?;
     ensure!(
@@ -96,14 +99,14 @@ fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descript
     })?;
     let blobs = store.blobs();
 
-    let total = recipe.steps.len() + 1;
-    eprintln!("[1/{total}] FROM {}", recipe.base);
+    let total = stage_recipe.steps.len() + 1;
+    eprintln!("[1/{total}] FROM {}", stage_recipe.base);
     let t0 = Instant::now();
-    let image = timed(trace, "pull", || registry::pull(&blobs, &recipe.base))?;
+    let image = timed(trace, "pull", || registry::pull(&blobs, &stage_recipe.base))?;
     let pulled = t0.elapsed();
     eprintln!("[1/{total}] done in {:.2}s", pulled.as_secs_f64());
     let mut step_times = vec![(
-        format!("step 1/{total} FROM {}", shown(&recipe.base)),
+        format!("step 1/{total} FROM {}", shown(&stage_recipe.base)),
         pulled,
     )];
     let mut stage = Stage::new(
@@ -119,7 +122,7 @@ fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descript
         resolv_conf: &resolv_conf,
         opts,
     };
-    for (i, step) in recipe.steps.iter().enumerate() {
+    for (i, step) in stage_recipe.steps.iter().enumerate() {
         let n = i + 2;
         let label = format!("step {n}/{total} {}", shown(&step.text));
         eprintln!("[{n}/{total}] {}", shown(&step.text));

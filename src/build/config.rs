@@ -219,7 +219,11 @@ mod tests {
     /// Applies every step of `body` (after a FROM line) and returns the actions.
     fn apply(stage: &mut Stage, body: &str) -> Result<Vec<Action>> {
         let recipe = check(&format!("FROM base\n{body}")).unwrap();
-        recipe.steps.iter().map(|s| stage.apply(s)).collect()
+        recipe.stages[0]
+            .steps
+            .iter()
+            .map(|s| stage.apply(s))
+            .collect()
     }
 
     #[test]
