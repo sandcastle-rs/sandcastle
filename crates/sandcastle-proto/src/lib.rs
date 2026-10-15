@@ -32,6 +32,8 @@ pub const GUEST_HELPER_PATH: &str = "/sandcastle-guest";
 /// virtio-fs tags; the guest mounts each at `/<tag>`.
 pub const SHARE_OUT: &str = "out";
 pub const SHARE_CTX: &str = "ctx";
+/// `<store>/images`, read-only: the erofs image of every layer, mounted as files.
+pub const SHARE_LAYERS: &str = "layers";
 
 /// Work the guest helper performs in one VM boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,10 +48,9 @@ pub enum Job {
 }
 
 impl Job {
-    /// The layers whose erofs images the job reads, in the order the host
-    /// attaches them as disks after the scratch disk (`/dev/vda`): the
+    /// Every layer whose erofs image the job mounts, each once: the
     /// destination stack bottom first, then source layers not already in it.
-    pub fn layer_disks(&self) -> Vec<&str> {
+    pub fn layers(&self) -> Vec<&str> {
         let (lower, source): (&[LowerLayer], &[LowerLayer]) = match self {
             Job::Probe { .. } => return Vec::new(),
             Job::Run(job) => (&job.lower, &[]),
@@ -58,13 +59,13 @@ impl Job {
                 CopySource::Layers { lower } => (&job.lower, lower),
             },
         };
-        let mut disks: Vec<&str> = Vec::new();
+        let mut layers: Vec<&str> = Vec::new();
         for layer in lower.iter().chain(source) {
-            if !disks.contains(&layer.diff_id.as_str()) {
-                disks.push(&layer.diff_id);
+            if !layers.contains(&layer.diff_id.as_str()) {
+                layers.push(&layer.diff_id);
             }
         }
-        disks
+        layers
     }
 }
 
@@ -308,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_disks_put_the_destination_first_and_attach_each_layer_once() {
+    fn layers_list_the_destination_first_and_each_layer_once() {
         let copy = |source| {
             Job::Copy(CopyJob {
                 lower: layers(&["a", "b", "a"]),
@@ -318,12 +319,12 @@ mod tests {
                 source,
             })
         };
-        assert_eq!(copy(CopySource::Context).layer_disks(), ["a", "b"]);
+        assert_eq!(copy(CopySource::Context).layers(), ["a", "b"]);
         let from = CopySource::Layers {
             lower: layers(&["c", "b", "d"]),
         };
-        assert_eq!(copy(from).layer_disks(), ["a", "b", "c", "d"]);
-        assert!(Job::Probe { exit_code: 0 }.layer_disks().is_empty());
+        assert_eq!(copy(from).layers(), ["a", "b", "c", "d"]);
+        assert!(Job::Probe { exit_code: 0 }.layers().is_empty());
     }
 
     #[test]

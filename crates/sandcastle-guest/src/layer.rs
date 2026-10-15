@@ -198,18 +198,22 @@ fn to_digest(hasher: Sha256) -> String {
     s
 }
 
-/// The kernel's name for virtio-blk disk `index` (0-based, in attach
-/// order): `vda`..`vdz`, then `vdaa`..`vdzz`, `vdaaa`.., as `virtblk_name_format`.
-pub fn disk_name(index: usize) -> String {
-    let mut letters = Vec::new();
-    let mut i = index + 1;
-    while i > 0 {
-        i -= 1;
-        letters.push(b'a' + (i % 26) as u8);
-        i /= 26;
-    }
-    letters.reverse();
-    format!("vd{}", String::from_utf8(letters).expect("ASCII letters"))
+/// File name of a layer's image on the `layers` share: the hex of a
+/// `sha256:<64 lowercase hex>` diff_id plus `.erofs`. Anything else is
+/// refused, so a job can't name a path outside the share.
+pub fn image_name(diff_id: &str) -> io::Result<String> {
+    diff_id
+        .strip_prefix("sha256:")
+        .filter(|hex| {
+            hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        .map(|hex| format!("{hex}.erofs"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid diff_id {diff_id:?}"),
+            )
+        })
 }
 
 /// Overlay `lowerdir+` order for a bottom-first layer list: top-most first.
@@ -277,17 +281,16 @@ mod tests {
     }
 
     #[test]
-    fn disk_names_follow_the_kernel_past_z() {
-        let names: Vec<String> = [0, 1, 25, 26, 27, 51, 52, 701, 702]
-            .into_iter()
-            .map(disk_name)
-            .collect();
+    fn image_names_accept_only_sha256_hex_diff_ids() {
+        let hex = "a".repeat(64);
         assert_eq!(
-            names,
-            [
-                "vda", "vdb", "vdz", "vdaa", "vdab", "vdaz", "vdba", "vdzz", "vdaaa"
-            ]
+            image_name(&format!("sha256:{hex}")).unwrap(),
+            format!("{hex}.erofs")
         );
+        assert!(image_name("sha256:../../etc/passwd").is_err());
+        assert!(image_name(&format!("sha512:{hex}")).is_err());
+        assert!(image_name(&format!("sha256:{}", "A".repeat(64))).is_err());
+        assert!(image_name(&format!("sha256:{hex}/")).is_err());
     }
 
     fn meta(mode: u32) -> Meta {

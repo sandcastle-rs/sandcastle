@@ -14,8 +14,8 @@ use sandcastle_proto::{
 
 use crate::commit;
 use crate::copy::{Copy, Owner};
-use crate::disks::Disks;
 use crate::events::Recorder;
+use crate::mounts::Mounts;
 use crate::overlay::{Overlay, ReadOnlyOverlay};
 
 pub const OUT: &str = "/out";
@@ -93,15 +93,15 @@ fn run_job(job: Job, out: &Path, rec: Option<&Recorder>) -> Result<Status> {
             ..Default::default()
         });
     }
-    let disks = phase(rec, "mount", None, || Disks::mount(&job))?;
+    let mounts = phase(rec, "mount", None, || Mounts::mount(&job))?;
     match job {
         Job::Probe { .. } => unreachable!("handled above"),
-        Job::Copy(job) => copy_job(&disks, &job, out, rec),
-        Job::Run(job) => crate::run::run_job(&disks, &job, out, rec),
+        Job::Copy(job) => copy_job(&mounts, &job, out, rec),
+        Job::Run(job) => crate::run::run_job(&mounts, &job, out, rec),
     }
 }
 
-fn copy_job(disks: &Disks, job: &CopyJob, out: &Path, rec: Option<&Recorder>) -> Result<Status> {
+fn copy_job(mounts: &Mounts, job: &CopyJob, out: &Path, rec: Option<&Recorder>) -> Result<Status> {
     let source = match &job.source {
         CopySource::Context => {
             mount(
@@ -115,7 +115,7 @@ fn copy_job(disks: &Disks, job: &CopyJob, out: &Path, rec: Option<&Recorder>) ->
             None
         }
         CopySource::Layers { lower } => {
-            let (lowers, work) = (disks.lower_dirs(lower)?, disks.work("copy-src")?);
+            let (lowers, work) = (mounts.lower_dirs(lower)?, mounts.work("copy-src")?);
             // The host only trusts known phase names; the detail tells
             // this overlay from the destination's.
             Some(phase(rec, "overlay", Some("source"), || {
@@ -123,7 +123,7 @@ fn copy_job(disks: &Disks, job: &CopyJob, out: &Path, rec: Option<&Recorder>) ->
             })?)
         }
     };
-    let (lowers, work) = (disks.lower_dirs(&job.lower)?, disks.work("copy")?);
+    let (lowers, work) = (mounts.lower_dirs(&job.lower)?, mounts.work("copy")?);
     let overlay = phase(rec, "overlay", None, || Overlay::mount(&lowers, &work))?;
     let copy = match &source {
         None => Copy {

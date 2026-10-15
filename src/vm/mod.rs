@@ -20,7 +20,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use oci_spec::image::Digest;
-use sandcastle_proto::{JOB_FILE, Job, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status};
+use sandcastle_proto::{JOB_FILE, Job, SHARE_CTX, SHARE_LAYERS, SHARE_OUT, STATUS_FILE, Status};
 use serde::{Deserialize, Serialize};
 
 use self::wait::{Children, Ended};
@@ -42,10 +42,10 @@ const MAX_MARKS_BYTES: u64 = 4096;
 pub const PARENT_PID_ENV: &str = "SANDCASTLE_PARENT_PID";
 /// Largest `status.json` read from the guest.
 const MAX_STATUS_BYTES: u64 = 1 << 20;
-/// Most layer images attached to one VM. libkrun takes about 123 virtio
-/// devices (disks and shares together) before `krun_start_enter` fails;
-/// this leaves room for the scratch disk and the shares.
-pub const MAX_LAYER_DISKS: usize = 100;
+/// Most layers one job reads: overlayfs stacks at most 500 lower dirs, and
+/// a job adds one of its own (RUN's mount-point stubs, or the empty bottom
+/// of a `COPY --from` source).
+pub const MAX_LAYERS: usize = 499;
 /// The job's private disk, in its job directory: overlay upper and work dirs.
 const SCRATCH_DISK: &str = "scratch.ext4";
 
@@ -62,19 +62,12 @@ pub struct Share {
     pub read_only: bool,
 }
 
-/// A disk image attached as the next virtio-blk device.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Disk {
-    pub path: PathBuf,
-    pub read_only: bool,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VmSpec {
     pub lib_dir: PathBuf,
     pub guest_root: PathBuf,
-    /// The scratch disk, then the layer images in [`Job::layer_disks`] order.
-    pub disks: Vec<Disk>,
+    /// The job's private ext4 disk, the guest's only disk (`/dev/vda`).
+    pub scratch_disk: PathBuf,
     pub shares: Vec<Share>,
     pub vcpus: u8,
     pub ram_mib: u32,
@@ -130,21 +123,16 @@ impl Vm<'_> {
     /// Runs `job` in a fresh microVM. `ctx` is shared read-only at `/ctx`.
     /// Every layer the job reads must have its image in the store.
     pub fn run(&self, job: &Job, ctx: Option<&Path>) -> Result<Finished> {
-        let layers = job.layer_disks();
+        let layers = job.layers();
         ensure!(
-            layers.len() <= MAX_LAYER_DISKS,
-            "the step reads {} layers; one VM takes at most {MAX_LAYER_DISKS}",
+            layers.len() <= MAX_LAYERS,
+            "the step reads {} layers; overlayfs stacks at most {MAX_LAYERS}",
             layers.len()
         );
         let images = self.store.layer_images();
-        let mut layer_disks = Vec::with_capacity(layers.len());
-        for diff_id in layers {
+        for diff_id in &layers {
             let path = images.path(&Digest::from_str(diff_id)?)?;
             ensure!(path.is_file(), "layer {diff_id} has no image in the store");
-            layer_disks.push(Disk {
-                path,
-                read_only: true,
-            });
         }
         let mut finished = Finished {
             status: Status::default(),
@@ -163,6 +151,16 @@ impl Vm<'_> {
             path: out_dir.clone(),
             read_only: false,
         }];
+        // One share for every image, so a job uses the same few virtio
+        // devices however tall its stack: x86_64 libkrun runs out of IRQs
+        // at about a dozen devices.
+        if !layers.is_empty() {
+            shares.push(Share {
+                tag: SHARE_LAYERS.into(),
+                path: self.store.images_dir(),
+                read_only: true,
+            });
+        }
         if let Some(ctx) = ctx {
             shares.push(Share {
                 tag: SHARE_CTX.into(),
@@ -171,16 +169,10 @@ impl Vm<'_> {
             });
         }
         let scratch = finished.dir.join(SCRATCH_DISK);
-        let disks = std::iter::once(Disk {
-            path: scratch.clone(),
-            read_only: false,
-        })
-        .chain(layer_disks)
-        .collect();
         let spec = VmSpec {
             lib_dir: self.install.lib_dir.clone(),
             guest_root: self.store.guest_root(),
-            disks,
+            scratch_disk: scratch.clone(),
             shares,
             vcpus: self.resources.vcpus,
             ram_mib: self.resources.ram_mib,
@@ -371,7 +363,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_stack_over_the_disk_budget_fails_before_the_vm_starts() {
+    fn a_stack_overlayfs_cannot_hold_fails_before_the_vm_starts() {
         let (dir, install) = crate::store::test_support::fixture();
         let store = Store::open(&dir.path().join("store"), &install).unwrap();
         let vm = Vm::new(
@@ -380,7 +372,7 @@ mod tests {
             &store,
             Resources::default(),
         );
-        let lower = (0..=MAX_LAYER_DISKS)
+        let lower = (0..=MAX_LAYERS)
             .map(|i| sandcastle_proto::LowerLayer {
                 diff_id: format!("sha256:{i:064x}"),
             })
@@ -396,7 +388,7 @@ mod tests {
         });
         let err = vm.run(&job, None).err().unwrap();
         assert!(
-            format!("{err:#}").contains("reads 101 layers; one VM takes at most 100"),
+            format!("{err:#}").contains("reads 500 layers; overlayfs stacks at most 499"),
             "{err:#}"
         );
         let jobs = fs::read_dir(store.root().join("jobs")).unwrap().count();

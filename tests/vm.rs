@@ -496,14 +496,14 @@ fn run_creating_a_reserved_whiteout_name_fails_the_step() {
 
 #[test]
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
-fn run_cannot_reach_the_vm_disks() {
+fn run_cannot_reach_the_vm_mounts() {
     let (_dir, exe, install, store) = store();
     let vm = Vm::new(&exe, &install, &store, Resources::default());
     let base = busybox(&store);
     let script = "mknod /tmp/vda b 254 0 2>/dev/null || echo blocked > /m1; \
                   mkdir -p /mnt; mount -t tmpfs none /mnt 2>/dev/null || echo blocked > /m2; \
                   touch /f && chown 65534 /f && echo ok > /m3; \
-                  grep -c ' /scratch' /proc/self/mountinfo > /m4; \
+                  grep -cE ' /(scratch|layers)' /proc/self/mountinfo > /m4; \
                   test ! -e /scratch/layers && echo ok > /m6; \
                   echo x > /proc/sys/kernel/core_pattern 2>/dev/null || echo blocked > /m5";
     let (finished, _) = run_step(&vm, &store, &base, &run_job(base.clone(), script, ""));
@@ -520,7 +520,7 @@ fn run_cannot_reach_the_vm_disks() {
     assert_eq!(entries["m2"].2, b"blocked\n");
     assert_eq!(
         entries["m4"].2, b"0\n",
-        "the scratch disk is still mounted in the step"
+        "the scratch disk or the layer images are still mounted in the step"
     );
     assert_eq!(entries["m5"].2, b"blocked\n");
 }
@@ -680,12 +680,13 @@ fn tar_of(entries: &[(&str, u32, u64, &[u8])]) -> Vec<u8> {
     builder.into_inner().unwrap()
 }
 
-/// Layers past the 26th disk (`/dev/vdz`) get two-letter names.
-const LONG_STACK: usize = 30;
+/// Past both device limits a disk per layer hit: about 120 virtio devices
+/// on macOS, about a dozen on x86_64.
+const LONG_STACK: usize = 150;
 
 #[test]
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
-fn a_stack_past_vdz_is_stacked_in_order_and_images_stay_unchanged() {
+fn a_tall_stack_is_stacked_in_order_and_images_stay_unchanged() {
     let (_dir, exe, install, store) = store();
     let vm = Vm::new(&exe, &install, &store, Resources::default());
     let images = store.layer_images();

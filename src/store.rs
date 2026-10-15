@@ -16,7 +16,9 @@ use crate::layer_image::LayerImages;
 
 pub use sandcastle_proto::GUEST_HELPER_PATH;
 /// Mount points libkrun's init and the guest helper expect on the root share.
-const GUEST_DIRS: &[&str] = &["dev", "proc", "sys", "tmp", "out", "scratch", "ctx"];
+const GUEST_DIRS: &[&str] = &[
+    "dev", "proc", "sys", "tmp", "out", "scratch", "ctx", "layers",
+];
 /// The ext4 disk all VMs shared before layer images; removed to free its space.
 const OLD_STORE_DISK: &str = "store.ext4";
 /// Largest single template record accepted, bounding the read buffer.
@@ -117,7 +119,12 @@ impl Store {
 
     /// Erofs images of layers, by diff_id. Borrowing keeps the store lock held.
     pub fn layer_images(&self) -> LayerImages<'_> {
-        LayerImages::new(self.root.join("images"), self.erofs_converter.clone())
+        LayerImages::new(self.images_dir(), self.erofs_converter.clone())
+    }
+
+    /// Where the layer images live; shared read-only with every job's VM.
+    pub(crate) fn images_dir(&self) -> PathBuf {
+        self.root.join("images")
     }
 
     fn prepare_guest_root(&self, helper: &Path) -> Result<()> {

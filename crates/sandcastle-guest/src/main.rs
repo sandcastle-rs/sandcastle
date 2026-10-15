@@ -18,9 +18,9 @@ mod user;
 #[cfg(target_os = "linux")]
 mod commit;
 #[cfg(target_os = "linux")]
-mod disks;
-#[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod mounts;
 #[cfg(target_os = "linux")]
 mod overlay;
 #[cfg(target_os = "linux")]

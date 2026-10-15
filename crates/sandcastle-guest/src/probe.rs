@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rustix::mount::{FsOpenFlags, fsconfig_create, fsconfig_set_string, fsopen};
 use sandcastle_proto::ProbeReport;
 
-use crate::disks::{SCRATCH, mount_scratch};
+use crate::mounts::{SCRATCH, mount_scratch};
 
 pub fn run() -> Result<ProbeReport> {
     mount_scratch()?;

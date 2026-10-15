@@ -24,9 +24,9 @@ use sandcastle_proto::{GUEST_HELPER_PATH, RunJob, Status};
 use serde::{Deserialize, Serialize};
 
 use crate::copy::resolve_in_root;
-use crate::disks::Disks;
 use crate::events::Recorder;
 use crate::linux::{commit_upper, phase};
+use crate::mounts::Mounts;
 use crate::overlay::Overlay;
 use crate::trace_filter::MarkerFilter;
 use crate::user;
@@ -70,9 +70,14 @@ struct ExecSpec {
     groups: Vec<u32>,
 }
 
-pub fn run_job(disks: &Disks, job: &RunJob, out: &Path, rec: Option<&Recorder>) -> Result<Status> {
-    let work = disks.work("run")?;
-    let mut lowers = disks.lower_dirs(&job.lower)?;
+pub fn run_job(
+    mounts: &Mounts,
+    job: &RunJob,
+    out: &Path,
+    rec: Option<&Recorder>,
+) -> Result<Status> {
+    let work = mounts.work("run")?;
+    let mut lowers = mounts.lower_dirs(&job.lower)?;
     lowers.push(stub_layer(&work)?);
     write_etc(&job.resolv_conf)?;
     let overlay = phase(rec, "overlay", None, || Overlay::mount(&lowers, &work))?;
