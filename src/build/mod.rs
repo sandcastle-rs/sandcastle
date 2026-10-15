@@ -22,6 +22,7 @@ use crate::blobs::BlobStore;
 use crate::dockerfile::{self, Recipe, StageRecipe, Step};
 use crate::image::{self, ConfigState, Layer, LayerWriter};
 use crate::install::{self, Install};
+use crate::layer_image::{self, LayerImages};
 use crate::registry;
 use crate::store::Store;
 use crate::trace::{Span, Trace};
@@ -107,14 +108,22 @@ fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descript
         Store::open(&install::store_root()?, &install)
     })?;
     let blobs = store.blobs();
+    let layer_images = store.layer_images();
 
     let mut step_times = Vec::new();
-    let images = pull_images(&blobs, &image_uses(&recipe, &plan), trace, &mut step_times)?;
+    let images = pull_images(
+        &blobs,
+        &layer_images,
+        &image_uses(&recipe, &plan),
+        trace,
+        &mut step_times,
+    )?;
     let vm = Vm::new(exe, &install, &store, opts.resources);
     let resolv_conf = dns::resolv_conf();
     let env = StepEnv {
         vm: &vm,
         blobs: &blobs,
+        layer_images: &layer_images,
         context: &context,
         resolv_conf: &resolv_conf,
         opts,
@@ -257,9 +266,11 @@ fn image_uses<'a>(recipe: &'a Recipe, plan: &'a BuildPlan) -> Vec<ImageUse<'a>> 
 }
 
 /// Pulls every image in `uses` before any VM runs, so a bad reference or
-/// a network failure costs no build time. Returns each image's base state.
+/// a network failure costs no build time, and converts each layer to its
+/// erofs image. Returns each image's base state.
 fn pull_images<'a>(
     blobs: &BlobStore<'_>,
+    layer_images: &LayerImages<'_>,
     uses: &[ImageUse<'a>],
     trace: &mut Trace,
     step_times: &mut Vec<(String, Duration)>,
@@ -280,6 +291,18 @@ fn pull_images<'a>(
         });
         eprintln!("pulled {} in {:.2}s", u.reference, dur.as_secs_f64());
         step_times.push((format!("pull {}", shown(u.reference)), dur));
+        let t0 = Instant::now();
+        for (layer, diff_id) in state.layers.iter().zip(&state.diff_ids) {
+            layer_images
+                .ensure(diff_id, || layer_image::layer_tar(blobs, layer))
+                .with_context(what)?;
+        }
+        trace.push(Span {
+            name: "convert".into(),
+            start: trace.at(t0),
+            dur: t0.elapsed(),
+            args: vec![("reference".into(), u.reference.into())],
+        });
         images.insert(u.reference, state);
     }
     Ok(images)
@@ -321,6 +344,7 @@ fn print_summary(mut steps: Vec<(String, Duration)>) {
 struct StepEnv<'a> {
     vm: &'a Vm<'a>,
     blobs: &'a BlobStore<'a>,
+    layer_images: &'a LayerImages<'a>,
     context: &'a Path,
     resolv_conf: &'a str,
     opts: &'a Options,
@@ -422,12 +446,23 @@ fn run_step(
         None => stage.state.add_empty(&step.text)?,
         Some(diff_id) => {
             let t0 = Instant::now();
-            let layer = ingest(env.blobs, &finished.out_dir().join(LAYER_FILE), diff_id)?;
+            let tar = finished.out_dir().join(LAYER_FILE);
+            let layer = ingest(env.blobs, &tar, diff_id)?;
             ingested = t0.elapsed();
             trace.push(Span {
                 name: "ingest".into(),
                 start: trace.at(t0),
                 dur: ingested,
+                args: Vec::new(),
+            });
+            let t0 = Instant::now();
+            env.layer_images.ensure(&layer.diff_id, || {
+                vm::open_guest_file(&tar)?.context("the guest's layer.tar is gone")
+            })?;
+            trace.push(Span {
+                name: "convert".into(),
+                start: trace.at(t0),
+                dur: t0.elapsed(),
                 args: Vec::new(),
             });
             stage.state.add_layer(layer, &step.text)?;

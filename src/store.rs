@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::blobs::BlobStore;
 use crate::install::Install;
+use crate::layer_image::LayerImages;
 
 pub use sandcastle_proto::GUEST_HELPER_PATH;
 /// Mount points libkrun's init and the guest helper expect on the root share.
@@ -22,6 +23,7 @@ const TEMPLATE_MAGIC: &[u8; 4] = b"SCX1";
 
 pub struct Store {
     root: PathBuf,
+    erofs_converter: PathBuf,
     next_job: AtomicU32,
     /// Held for the life of the store; released by the OS if we crash.
     _lock: File,
@@ -67,8 +69,16 @@ impl Store {
         fs::create_dir_all(blobs.join("sha256"))?;
         fs::create_dir_all(&blob_tmp)?;
 
+        let image_tmp = root.join("images").join("tmp");
+        if image_tmp.exists() {
+            fs::remove_dir_all(&image_tmp)
+                .context("removing partial layer images left by an earlier run")?;
+        }
+        fs::create_dir_all(&image_tmp)?;
+
         let store = Self {
             root,
+            erofs_converter: install.erofs_converter(),
             next_job: AtomicU32::new(0),
             _lock: lock,
         };
@@ -111,6 +121,11 @@ impl Store {
     /// The content-addressed blob store. Borrowing keeps the store lock held.
     pub fn blobs(&self) -> BlobStore<'_> {
         BlobStore::new(self.blobs_dir())
+    }
+
+    /// Erofs images of layers, by diff_id. Borrowing keeps the store lock held.
+    pub fn layer_images(&self) -> LayerImages<'_> {
+        LayerImages::new(self.root.join("images"), self.erofs_converter.clone())
     }
 
     fn prepare_guest_root(&self, helper: &Path) -> Result<()> {

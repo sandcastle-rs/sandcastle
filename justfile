@@ -24,7 +24,7 @@ it: build
     mkdir -p target/it
     cp target/release/sandcastle target/release/sandcastle-guest target/it/
     {{ if os() == "macos" { "codesign --force --sign - --entitlements sandcastle.entitlements " + it_bin } else { "true" } }}
-    SANDCASTLE_LIBKRUN_DIR={{lib_dir}} SANDCASTLE_BIN={{it_bin}} cargo test --release -p sandcastle --test vm --test cli --test build -- --ignored --test-threads=1
+    SANDCASTLE_LIBKRUN_DIR={{lib_dir}} SANDCASTLE_BIN={{it_bin}} cargo test --release -p sandcastle --test vm --test cli --test build --test layer_image -- --ignored --test-threads=1
 
 # Registry tests: need network, lib/ (store template) and skopeo.
 it-registry:
