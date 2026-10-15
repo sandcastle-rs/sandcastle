@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use oci_spec::image::Descriptor;
-use sandcastle_proto::{CopyJob, EVENTS_FILE, Job, KMSG_FILE, LAYER_FILE, MAX_KMSG_BYTES, RunJob};
+use sandcastle_proto::{
+    CopyJob, CopySource, EVENTS_FILE, Job, KMSG_FILE, LAYER_FILE, MAX_KMSG_BYTES, RunJob,
+};
 
 use crate::blobs::BlobStore;
 use crate::dockerfile::{self, Step};
@@ -200,6 +202,7 @@ fn run_step(
                 sources,
                 dest,
                 workdir: stage.workdir(),
+                source: CopySource::Context,
             }),
             Some(env.context),
             true,
