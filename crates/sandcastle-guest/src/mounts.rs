@@ -13,7 +13,9 @@ use anyhow::{Context, Result};
 use rustix::mount::{MountFlags, mount};
 use sandcastle_proto::{Job, LowerLayer, SHARE_LAYERS};
 
+use crate::events::Recorder;
 use crate::layer;
+use crate::linux::phase;
 
 /// The scratch disk's mount point.
 pub const SCRATCH: &str = "/scratch";
@@ -26,14 +28,19 @@ pub struct Mounts {
 }
 
 impl Mounts {
-    /// Mounts the scratch disk and the image of every layer `job` reads.
-    pub fn mount(job: &Job) -> Result<Self> {
-        mount_scratch()?;
+    /// Mounts the scratch disk and the image of every layer `job` reads,
+    /// recorded as `mount` phases with what was mounted as the detail.
+    pub fn mount(job: &Job, rec: Option<&Recorder>) -> Result<Self> {
+        phase(rec, "mount", Some("scratch"), mount_scratch)?;
         let root = Path::new(SCRATCH);
         let work = root.join("work");
         fs::create_dir(&work)?;
         let ids = job.layers();
-        if !ids.is_empty() {
+        let mut layers = HashMap::new();
+        if ids.is_empty() {
+            return Ok(Self { work, layers });
+        }
+        phase(rec, "mount", Some("share"), || {
             mount(
                 SHARE_LAYERS,
                 LAYERS,
@@ -41,18 +48,20 @@ impl Mounts {
                 MountFlags::RDONLY,
                 None::<&CStr>,
             )
-            .context("mounting the layer images")?;
-        }
-        let mut layers = HashMap::new();
-        for (i, diff_id) in ids.into_iter().enumerate() {
-            let image = Path::new(LAYERS).join(layer::image_name(diff_id)?);
-            let dir = root.join("layers").join(i.to_string());
-            fs::create_dir_all(&dir)?;
-            // erofs reads a regular file as its backing store.
-            mount(&image, &dir, "erofs", MountFlags::RDONLY, None::<&CStr>)
-                .with_context(|| format!("mounting the image of layer {diff_id}"))?;
-            layers.insert(diff_id.to_owned(), dir);
-        }
+        })
+        .context("mounting the layer images")?;
+        phase(rec, "mount", Some("images"), || -> Result<()> {
+            for (i, diff_id) in ids.into_iter().enumerate() {
+                let image = Path::new(LAYERS).join(layer::image_name(diff_id)?);
+                let dir = root.join("layers").join(i.to_string());
+                fs::create_dir_all(&dir)?;
+                // erofs reads a regular file as its backing store.
+                mount(&image, &dir, "erofs", MountFlags::RDONLY, None::<&CStr>)
+                    .with_context(|| format!("mounting the image of layer {diff_id}"))?;
+                layers.insert(diff_id.to_owned(), dir);
+            }
+            Ok(())
+        })?;
         Ok(Self { work, layers })
     }
 

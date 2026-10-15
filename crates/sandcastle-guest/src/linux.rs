@@ -93,7 +93,7 @@ fn run_job(job: Job, out: &Path, rec: Option<&Recorder>) -> Result<Status> {
             ..Default::default()
         });
     }
-    let mounts = phase(rec, "mount", None, || Mounts::mount(&job))?;
+    let mounts = Mounts::mount(&job, rec)?;
     match job {
         Job::Probe { .. } => unreachable!("handled above"),
         Job::Copy(job) => copy_job(&mounts, &job, out, rec),
