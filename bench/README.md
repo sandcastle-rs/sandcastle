@@ -23,7 +23,7 @@ The package cases download from the internet in every run, so they include netwo
 
 ## macOS setup
 
-0. Prerequisites: Rust via rustup plus `rustup target add aarch64-unknown-linux-musl`; `just`; `podman`; and `lib/`, from either `just fetch-libs` or `just build-libs` (after `brew install lld xz e2fsprogs zstd`). `bench/run.sh` fails early if `lib/` is missing.
+0. Prerequisites: Rust via rustup plus `rustup target add aarch64-unknown-linux-musl`; `just`; `podman`; and `lib/`, from either `just fetch-libs` or `just build-libs` (after `brew install lld xz e2fsprogs zstd autoconf automake libtool pkgconf`). `bench/run.sh` fails early if `lib/` is missing.
 1. `brew install hyperfine buildkit skopeo` (python3 3.9 or newer is also needed, for `gen-context.sh`)
 2. Start a podman machine: `podman machine start`. For the rootful BuildKit mode the machine must be rootful (`podman machine set --rootful`, while stopped). Rootless BuildKit inside the macOS podman machine was tried and fails at the first `RUN` (`error mounting "devpts" ... permission denied`), so on macOS use rootful.
    sandcastle gives each step VM all host CPUs and 2048 MiB, while BuildKit is capped by the podman machine. Size the machine to the host CPU count (`podman machine stop; podman machine set --cpus "$(sysctl -n hw.ncpu)"; podman machine start`), or treat the numbers as not CPU-matched. `environment.md` records both budgets.
