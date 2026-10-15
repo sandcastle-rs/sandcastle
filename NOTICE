@@ -11,7 +11,9 @@ sandcastle release archives bundle third-party components in lib/:
   MIT with GPL-2.0+ OR MIT library code and two GPL-2.0-only headers, so the
   binary is distributed under GPL-2.0. Licenses in lib/licenses/
   (COPYING-erofs-utils, LICENSE-erofs-utils-*); the source version and
-  checksum are in lib/PROVENANCE.
+  checksum are in lib/PROVENANCE. On Linux it is statically linked with
+  glibc (LGPL-2.1+, lib/licenses/LICENSE-glibc-LGPL-2.1; version in
+  lib/PROVENANCE); scripts/build-libs.sh rebuilds it from that source.
 
 The sandcastle-dockerfile crate ports BuildKit's frontend/dockerfile parser,
 instructions and shell packages (https://github.com/moby/buildkit,

@@ -10,7 +10,8 @@ source "$(dirname "$0")/lib.sh"
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
     build-essential ca-certificates curl git python3 skopeo hyperfine docker.io \
-    patchelf libc6-dev e2fsprogs zstd binutils clang libclang-dev lld fuse-overlayfs uidmap
+    patchelf libc6-dev e2fsprogs zstd binutils clang libclang-dev lld fuse-overlayfs uidmap \
+    autoconf automake libtool pkg-config
 sudo usermod -aG kvm,docker "$USER"
 
 if ! command -v rustup >/dev/null; then

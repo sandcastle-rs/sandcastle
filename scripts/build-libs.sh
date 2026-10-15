@@ -117,7 +117,10 @@ python3 "$here/pack-sparse.py" "$work/store.ext4" | zstd -q -19 -o "$out/store-t
 
 # mkfs.erofs from erofs-utils, for converting layer tars to erofs images.
 # The host feeds it uncompressed tars, so every optional library is left
-# out: only libc (and pthreads) is linked.
+# out: only libc (and pthreads) is linked. On Linux it is linked statically:
+# glibc 2.38+ headers redirect its strtoul calls to __isoc23_* symbols, so a
+# dynamic build on a newer distro would not run on older ones. It uses no
+# NSS (getpwnam, getaddrinfo, ...), which static glibc can't serve.
 fetch "https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-$EROFS_UTILS_VERSION.tar.gz" \
     "$EROFS_UTILS_SRC_SHA256" "$work/erofs-utils.tgz"
 tar -xzf "$work/erofs-utils.tgz" -C "$work"
@@ -134,7 +137,11 @@ erofs_src="$work/erofs-utils-$EROFS_UTILS_VERSION"
         --disable-fuse --without-uuid --without-selinux
 )
 make -C "$erofs_src/lib" -j"$(ncpu)" >/dev/null
-make -C "$erofs_src/mkfs" -j"$(ncpu)" >/dev/null
+case "$os" in
+# libtool's -all-static (a plain -static only prefers static libtool libs).
+Linux) make -C "$erofs_src/mkfs" -j"$(ncpu)" LDFLAGS=-all-static >/dev/null ;;
+*) make -C "$erofs_src/mkfs" -j"$(ncpu)" >/dev/null ;;
+esac
 erofs_bin="$out/mkfs.erofs"
 cp "$erofs_src/mkfs/mkfs.erofs" "$erofs_bin"
 # MIT, with GPL-2.0-only headers compiled in (hashmap.h, flex-array.h).
@@ -148,13 +155,12 @@ Darwin)
     fi
     ;;
 Linux)
-    if objdump -p "$erofs_bin" | awk '/NEEDED/ {print $2}' | grep -vE '^(libc|libpthread)\.so\.'; then
-        echo "mkfs.erofs links libraries beyond libc (listed above)" >&2; exit 1
+    if objdump -p "$erofs_bin" | grep -qE '^\s*(INTERP|DYNAMIC)\b'; then
+        objdump -p "$erofs_bin" | awk '/NEEDED/ {print "  needs " $2}' >&2
+        echo "mkfs.erofs is not statically linked" >&2; exit 1
     fi
-    newest="$(objdump -T "$erofs_bin" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
-    if [ "$(printf '%s\n%s\n' "$newest" "$GLIBC_MAX" | sort -V | tail -1)" != "$GLIBC_MAX" ]; then
-        echo "mkfs.erofs needs glibc $newest > $GLIBC_MAX" >&2; exit 1
-    fi
+    # glibc is linked in, so its license ships too.
+    cp /usr/share/common-licenses/LGPL-2.1 "$out/licenses/LICENSE-glibc-LGPL-2.1"
     ;;
 esac
 
@@ -162,6 +168,9 @@ esac
     echo "libkrun $LIBKRUN_TAG source sha256 $LIBKRUN_SRC_SHA256 (https://github.com/containers/libkrun)"
     echo "libkrunfw $LIBKRUNFW_TAG (https://github.com/containers/libkrunfw/tree/$LIBKRUNFW_TAG)"
     echo "erofs-utils $EROFS_UTILS_VERSION source sha256 $EROFS_UTILS_SRC_SHA256 (https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git)"
+    if [ "$os" = Linux ]; then
+        echo "mkfs.erofs statically links $(ldd --version | head -1)"
+    fi
     for p in "$here"/patches/libkrun-*.patch; do
         echo "libkrun patch $(basename "$p") sha256 $(shasum -a 256 "$p" | cut -d' ' -f1)"
     done
