@@ -1,33 +1,21 @@
-//! `Job::Probe`: checks the store disk and overlayfs inside the guest.
+//! `Job::Probe`: checks the scratch disk and overlayfs inside the guest.
 
-use std::ffi::CStr;
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rustix::mount::{
-    FsOpenFlags, MountFlags, UnmountFlags, fsconfig_create, fsconfig_set_string, fsopen, mount,
-    unmount,
-};
+use rustix::mount::{FsOpenFlags, fsconfig_create, fsconfig_set_string, fsopen};
 use sandcastle_proto::ProbeReport;
 
-/// First virtio-blk device: the store disk added by the host.
-const STORE_DEV: &str = "/dev/vda";
-const STORE: &str = "/store";
+use crate::disks::{SCRATCH, mount_scratch};
 
 pub fn run() -> Result<ProbeReport> {
-    mount(STORE_DEV, STORE, "ext4", MountFlags::NOATIME, None::<&CStr>)
-        .context("mounting the store disk")?;
-    let dir = Path::new(STORE).join("probe");
-    if dir.exists() {
-        fs::remove_dir_all(&dir)?;
-    }
+    mount_scratch()?;
+    let dir = Path::new(SCRATCH).join("probe");
     for sub in ["l1", "l2", "upper", "work"] {
-        fs::create_dir_all(dir.join(sub)).context("writing to the store disk")?;
+        fs::create_dir_all(dir.join(sub)).context("writing to the scratch disk")?;
     }
     let overlay_lowerdir_plus = overlay_lowerdir_plus(&dir).is_ok();
-    fs::remove_dir_all(&dir)?;
-    unmount(STORE, UnmountFlags::empty()).context("unmounting the store disk")?;
     Ok(ProbeReport {
         kernel_release: rustix::system::uname()
             .release()

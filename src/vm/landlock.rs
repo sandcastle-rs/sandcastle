@@ -18,6 +18,7 @@ pub struct Rules<'a> {
     pub rw_dirs: &'a [&'a Path],
     pub ro_dirs: &'a [&'a Path],
     pub rw_files: &'a [&'a Path],
+    pub ro_files: &'a [&'a Path],
     pub devices: &'a [&'a Path],
 }
 
@@ -33,10 +34,14 @@ pub fn restrict(spec: &VmSpec) -> Result<()> {
             rw_dirs.push(share.path.as_path());
         }
     }
+    let (ro_disks, rw_disks): (Vec<_>, Vec<_>) = spec.disks.iter().partition(|d| d.read_only);
+    let rw_files: Vec<&Path> = rw_disks.iter().map(|d| d.path.as_path()).collect();
+    let ro_files: Vec<&Path> = ro_disks.iter().map(|d| d.path.as_path()).collect();
     let enforced = restrict_paths(&Rules {
         rw_dirs: &rw_dirs,
         ro_dirs: &ro_dirs,
-        rw_files: &[spec.disk.as_path()],
+        rw_files: &rw_files,
+        ro_files: &ro_files,
         devices: &[Path::new("/dev/kvm")],
     })?;
     if !enforced {
@@ -65,6 +70,9 @@ pub fn restrict_paths(rules: &Rules) -> Result<bool> {
     }
     for file in rules.rw_files {
         ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(file)?, file_rw))?;
+    }
+    for file in rules.ro_files {
+        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(file)?, AccessFs::ReadFile))?;
     }
     for dev in rules.devices {
         ruleset = ruleset.add_rule(PathBeneath::new(
@@ -96,6 +104,7 @@ mod tests {
                 rw_dirs: &[a.as_path()],
                 ro_dirs: &[],
                 rw_files: &[],
+                ro_files: &[],
                 devices: &[],
             };
             let enforced = restrict_paths(&rules).unwrap();

@@ -18,6 +18,8 @@ mod user;
 #[cfg(target_os = "linux")]
 mod commit;
 #[cfg(target_os = "linux")]
+mod disks;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod overlay;
@@ -25,10 +27,6 @@ mod overlay;
 mod probe;
 #[cfg(target_os = "linux")]
 mod run;
-#[cfg(target_os = "linux")]
-mod store;
-#[cfg(target_os = "linux")]
-mod unpack;
 
 #[cfg(target_os = "linux")]
 fn main() {

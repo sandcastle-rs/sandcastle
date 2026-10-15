@@ -15,6 +15,7 @@ use oci_spec::image::{Descriptor, Digest, DigestAlgorithm, MediaType};
 use tempfile::NamedTempFile;
 
 use crate::blobs::{BlobStore, digest_from};
+use crate::image::ConfigState;
 use crate::store::Store;
 
 /// Converter arguments: build from a tar on stdin (`--tar=f`), turn OCI
@@ -78,16 +79,31 @@ impl LayerImages<'_> {
     }
 }
 
+impl LayerImages<'_> {
+    /// Builds the image of every layer of `state` from its blob in `blobs`.
+    pub fn ensure_state(&self, blobs: &BlobStore<'_>, state: &ConfigState) -> Result<()> {
+        for (layer, diff_id) in state.layers.iter().zip(&state.diff_ids) {
+            self.ensure(diff_id, || layer_tar(blobs, layer))?;
+        }
+        Ok(())
+    }
+}
+
 /// The uncompressed tar of a layer blob in `blobs`.
-pub fn layer_tar(blobs: &BlobStore<'_>, layer: &Descriptor) -> Result<Box<dyn Read>> {
-    let file = BufReader::with_capacity(CHUNK, File::open(blobs.path(layer.digest())?)?);
-    Ok(match layer.media_type() {
-        MediaType::ImageLayer => Box::new(file),
-        MediaType::ImageLayerGzip => Box::new(GzDecoder::new(file)),
+fn layer_tar(blobs: &BlobStore<'_>, layer: &Descriptor) -> Result<Box<dyn Read>> {
+    let gzip = match layer.media_type() {
+        MediaType::ImageLayer => false,
+        MediaType::ImageLayerGzip => true,
         other => bail!(
-            "layer {} is {other}; sandcastle can only unpack uncompressed and gzip layers (zstd is not supported yet)",
+            "layer {} is {other}; sandcastle can only read uncompressed and gzip layers (zstd is not supported yet)",
             layer.digest()
         ),
+    };
+    let file = BufReader::with_capacity(CHUNK, File::open(blobs.path(layer.digest())?)?);
+    Ok(if gzip {
+        Box::new(GzDecoder::new(file))
+    } else {
+        Box::new(file)
     })
 }
 
@@ -181,7 +197,22 @@ fn root_header() -> [u8; 512] {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
+
+    #[test]
+    fn zstd_layers_are_refused_before_their_blob_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().to_path_buf());
+        let digest = Digest::from_str(&format!("sha256:{}", "ab".repeat(32))).unwrap();
+        let layer = Descriptor::new(MediaType::ImageLayerZstd, 1, digest);
+        let err = layer_tar(&blobs, &layer).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("zstd is not supported"),
+            "{err:#}"
+        );
+    }
 
     #[test]
     fn root_header_is_a_root_owned_0755_directory() {

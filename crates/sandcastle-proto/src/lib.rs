@@ -31,12 +31,7 @@ pub const GUEST_HELPER_PATH: &str = "/sandcastle-guest";
 
 /// virtio-fs tags; the guest mounts each at `/<tag>`.
 pub const SHARE_OUT: &str = "out";
-pub const SHARE_BLOBS: &str = "blobs";
 pub const SHARE_CTX: &str = "ctx";
-
-/// Layer media types the guest can unpack.
-pub const LAYER_TAR: &str = "application/vnd.oci.image.layer.v1.tar";
-pub const LAYER_TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 
 /// Work the guest helper performs in one VM boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,13 +45,33 @@ pub enum Job {
     Copy(CopyJob),
 }
 
-/// One image layer a step builds on. The guest unpacks it from
-/// `/blobs/sha256/<blob hex>` if `/store/layers/<diff_id hex>` is missing.
+impl Job {
+    /// The layers whose erofs images the job reads, in the order the host
+    /// attaches them as disks after the scratch disk (`/dev/vda`): the
+    /// destination stack bottom first, then source layers not already in it.
+    pub fn layer_disks(&self) -> Vec<&str> {
+        let (lower, source): (&[LowerLayer], &[LowerLayer]) = match self {
+            Job::Probe { .. } => return Vec::new(),
+            Job::Run(job) => (&job.lower, &[]),
+            Job::Copy(job) => match &job.source {
+                CopySource::Context => (&job.lower, &[]),
+                CopySource::Layers { lower } => (&job.lower, lower),
+            },
+        };
+        let mut disks: Vec<&str> = Vec::new();
+        for layer in lower.iter().chain(source) {
+            if !disks.contains(&layer.diff_id.as_str()) {
+                disks.push(&layer.diff_id);
+            }
+        }
+        disks
+    }
+}
+
+/// One image layer a step builds on; the host attaches its erofs image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LowerLayer {
     pub diff_id: String,
-    pub blob: String,
-    pub media_type: String,
 }
 
 /// One line of `events.jsonl`. Times are microseconds since the guest
@@ -179,14 +194,14 @@ mod tests {
     #[test]
     fn run_job_wire_format() {
         let job: Job = serde_json::from_str(
-            r#"{"mode":"run","lower":[{"diff_id":"sha256:aa","blob":"sha256:bb","media_type":"application/vnd.oci.image.layer.v1.tar+gzip"}],
+            r#"{"mode":"run","lower":[{"diff_id":"sha256:aa"}],
                 "argv":["/bin/sh","-c","true"],"env":["PATH=/bin"],"user":"","workdir":"/","resolv_conf":"nameserver 8.8.8.8\n"}"#,
         )
         .unwrap();
         let Job::Run(run) = job else {
             panic!("not a run job")
         };
-        assert_eq!(run.lower[0].blob, "sha256:bb");
+        assert_eq!(run.lower[0].diff_id, "sha256:aa");
         assert_eq!(run.argv, ["/bin/sh", "-c", "true"]);
     }
 
@@ -211,7 +226,7 @@ mod tests {
 
     #[test]
     fn copy_from_layers_wire_format() {
-        let json = r#"{"mode":"copy","lower":[],"sources":["/out/app"],"dest":"/app","workdir":"/","source":{"kind":"layers","lower":[{"diff_id":"sha256:aa","blob":"sha256:bb","media_type":"application/vnd.oci.image.layer.v1.tar"}]}}"#;
+        let json = r#"{"mode":"copy","lower":[],"sources":["/out/app"],"dest":"/app","workdir":"/","source":{"kind":"layers","lower":[{"diff_id":"sha256:aa"}]}}"#;
         let job: Job = serde_json::from_str(json).unwrap();
         let Job::Copy(copy) = &job else {
             panic!("not a copy job")
@@ -282,6 +297,33 @@ mod tests {
             serde_json::to_string(&no_detail).unwrap(),
             r#"{"type":"phase","name":"commit","start_us":1,"dur_us":2}"#
         );
+    }
+
+    fn layers(ids: &[&str]) -> Vec<LowerLayer> {
+        ids.iter()
+            .map(|id| LowerLayer {
+                diff_id: id.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn layer_disks_put_the_destination_first_and_attach_each_layer_once() {
+        let copy = |source| {
+            Job::Copy(CopyJob {
+                lower: layers(&["a", "b", "a"]),
+                sources: vec![],
+                dest: "/".into(),
+                workdir: "/".into(),
+                source,
+            })
+        };
+        assert_eq!(copy(CopySource::Context).layer_disks(), ["a", "b"]);
+        let from = CopySource::Layers {
+            lower: layers(&["c", "b", "d"]),
+        };
+        assert_eq!(copy(from).layer_disks(), ["a", "b", "c", "d"]);
+        assert!(Job::Probe { exit_code: 0 }.layer_disks().is_empty());
     }
 
     #[test]

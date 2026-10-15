@@ -13,7 +13,8 @@ pub const GUEST_ENV: &str = "SANDCASTLE_GUEST";
 /// Overrides the store root (`~/.local/share/sandcastle`).
 pub const ROOT_ENV: &str = "SANDCASTLE_ROOT";
 
-const STORE_TEMPLATE: &str = "store-template.ext4.zst";
+/// Empty ext4 filesystem each job's scratch disk is expanded from.
+const DISK_TEMPLATE: &str = "store-template.ext4.zst";
 /// Converts layer tars to erofs layer images (erofs-utils, see `lib/PROVENANCE`).
 const EROFS_CONVERTER: &str = "mkfs.erofs";
 const GUEST_BIN: &str = "sandcastle-guest";
@@ -49,8 +50,8 @@ impl Install {
         })
     }
 
-    pub fn store_template(&self) -> PathBuf {
-        self.lib_dir.join(STORE_TEMPLATE)
+    pub fn disk_template(&self) -> PathBuf {
+        self.lib_dir.join(DISK_TEMPLATE)
     }
 
     pub fn erofs_converter(&self) -> PathBuf {

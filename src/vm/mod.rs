@@ -15,15 +15,17 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use sandcastle_proto::{JOB_FILE, Job, SHARE_BLOBS, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status};
+use oci_spec::image::Digest;
+use sandcastle_proto::{JOB_FILE, Job, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status};
 use serde::{Deserialize, Serialize};
 
 use self::wait::{Children, Ended};
 use crate::install::Install;
-use crate::store::Store;
+use crate::store::{Store, expand_sparse};
 
 /// VM description the parent writes into the job dir for the `__vm` child.
 pub const SPEC_FILE: &str = "vm.json";
@@ -40,6 +42,12 @@ const MAX_MARKS_BYTES: u64 = 4096;
 pub const PARENT_PID_ENV: &str = "SANDCASTLE_PARENT_PID";
 /// Largest `status.json` read from the guest.
 const MAX_STATUS_BYTES: u64 = 1 << 20;
+/// Most layer images attached to one VM. libkrun takes about 123 virtio
+/// devices (disks and shares together) before `krun_start_enter` fails;
+/// this leaves room for the scratch disk and the shares.
+pub const MAX_LAYER_DISKS: usize = 100;
+/// The job's private disk, in its job directory: overlay upper and work dirs.
+const SCRATCH_DISK: &str = "scratch.ext4";
 
 #[cfg(target_os = "linux")]
 const LIB_PATH_ENV: &str = "LD_LIBRARY_PATH";
@@ -54,11 +62,19 @@ pub struct Share {
     pub read_only: bool,
 }
 
+/// A disk image attached as the next virtio-blk device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Disk {
+    pub path: PathBuf,
+    pub read_only: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VmSpec {
     pub lib_dir: PathBuf,
     pub guest_root: PathBuf,
-    pub disk: PathBuf,
+    /// The scratch disk, then the layer images in [`Job::layer_disks`] order.
+    pub disks: Vec<Disk>,
     pub shares: Vec<Share>,
     pub vcpus: u8,
     pub ram_mib: u32,
@@ -112,7 +128,24 @@ impl<'a> Vm<'a> {
 
 impl Vm<'_> {
     /// Runs `job` in a fresh microVM. `ctx` is shared read-only at `/ctx`.
+    /// Every layer the job reads must have its image in the store.
     pub fn run(&self, job: &Job, ctx: Option<&Path>) -> Result<Finished> {
+        let layers = job.layer_disks();
+        ensure!(
+            layers.len() <= MAX_LAYER_DISKS,
+            "the step reads {} layers; one VM takes at most {MAX_LAYER_DISKS}",
+            layers.len()
+        );
+        let images = self.store.layer_images();
+        let mut layer_disks = Vec::with_capacity(layers.len());
+        for diff_id in layers {
+            let path = images.path(&Digest::from_str(diff_id)?)?;
+            ensure!(path.is_file(), "layer {diff_id} has no image in the store");
+            layer_disks.push(Disk {
+                path,
+                read_only: true,
+            });
+        }
         let mut finished = Finished {
             status: Status::default(),
             dir: self.store.new_job_dir()?,
@@ -130,13 +163,6 @@ impl Vm<'_> {
             path: out_dir.clone(),
             read_only: false,
         }];
-        if !matches!(job, Job::Probe { .. }) {
-            shares.push(Share {
-                tag: SHARE_BLOBS.into(),
-                path: self.store.blobs_dir(),
-                read_only: true,
-            });
-        }
         if let Some(ctx) = ctx {
             shares.push(Share {
                 tag: SHARE_CTX.into(),
@@ -144,10 +170,17 @@ impl Vm<'_> {
                 read_only: true,
             });
         }
+        let scratch = finished.dir.join(SCRATCH_DISK);
+        let disks = std::iter::once(Disk {
+            path: scratch.clone(),
+            read_only: false,
+        })
+        .chain(layer_disks)
+        .collect();
         let spec = VmSpec {
             lib_dir: self.install.lib_dir.clone(),
             guest_root: self.store.guest_root(),
-            disk: self.store.disk(),
+            disks,
             shares,
             vcpus: self.resources.vcpus,
             ram_mib: self.resources.ram_mib,
@@ -157,6 +190,13 @@ impl Vm<'_> {
         // libkrun dlopens libkrunfw by bare file name; point the loader at the bundle.
         finished.started = Instant::now();
         finished.started_ns = unix_ns();
+        // Part of the VM's start: a fresh disk per job, so no two VMs ever
+        // write the same one.
+        let template = self.install.disk_template();
+        let file =
+            File::open(&template).with_context(|| format!("opening {}", template.display()))?;
+        expand_sparse(zstd::Decoder::new(file)?, &scratch)
+            .with_context(|| format!("creating the scratch disk {}", scratch.display()))?;
         // Without a watch (inotify limits), wait for the process to exit.
         #[cfg(target_os = "linux")]
         let watch = wait::StatusWatch::new(&out_dir).ok();
@@ -329,6 +369,39 @@ pub fn outcome(child_exit: Option<i32>, status: Option<Status>) -> Result<Status
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stack_over_the_disk_budget_fails_before_the_vm_starts() {
+        let (dir, install) = crate::store::test_support::fixture();
+        let store = Store::open(&dir.path().join("store"), &install).unwrap();
+        let vm = Vm::new(
+            Path::new("/nonexistent"),
+            &install,
+            &store,
+            Resources::default(),
+        );
+        let lower = (0..=MAX_LAYER_DISKS)
+            .map(|i| sandcastle_proto::LowerLayer {
+                diff_id: format!("sha256:{i:064x}"),
+            })
+            .collect();
+        let job = Job::Run(sandcastle_proto::RunJob {
+            lower,
+            argv: vec!["true".into()],
+            env: vec![],
+            user: String::new(),
+            workdir: "/".into(),
+            resolv_conf: String::new(),
+            shell_form: false,
+        });
+        let err = vm.run(&job, None).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("reads 101 layers; one VM takes at most 100"),
+            "{err:#}"
+        );
+        let jobs = fs::read_dir(store.root().join("jobs")).unwrap().count();
+        assert_eq!(jobs, 0, "no job directory is created");
+    }
 
     #[test]
     fn status_file_wins_over_child_exit_code() {
