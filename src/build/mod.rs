@@ -10,10 +10,11 @@ pub mod plan;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use oci_spec::image::{Arch, Descriptor};
+use oci_spec::image::{Arch, Descriptor, Digest};
 use sandcastle_proto::{
     CopyJob, CopySource, EVENTS_FILE, Job, KMSG_FILE, LAYER_FILE, MAX_KMSG_BYTES, RunJob,
 };
@@ -443,26 +444,37 @@ fn run_step(
     match &status.layer {
         None => stage.state.add_empty(&step.text)?,
         Some(diff_id) => {
-            let t0 = Instant::now();
             let tar = finished.out_dir().join(LAYER_FILE);
-            let layer = ingest(env.blobs, &tar, diff_id)?;
-            ingested = t0.elapsed();
-            trace.push(Span {
-                name: "ingest".into(),
-                start: trace.at(t0),
-                dur: ingested,
-                args: Vec::new(),
-            });
+            let digest =
+                Digest::from_str(diff_id).context("the guest reported an invalid layer digest")?;
+            // The image is built from its own read of layer.tar while the
+            // layer is compressed: each checks the tar against diff_id.
             let t0 = Instant::now();
-            env.layer_images.ensure(&layer.diff_id, || {
-                vm::open_guest_file(&tar)?.context("the guest's layer.tar is gone")
-            })?;
-            trace.push(Span {
-                name: "convert".into(),
-                start: trace.at(t0),
-                dur: t0.elapsed(),
-                args: Vec::new(),
+            let (layer, converted) = std::thread::scope(|s| {
+                let convert = s.spawn(|| {
+                    let image = env.layer_images.ensure(&digest, || {
+                        vm::open_guest_file(&tar)?.context("the guest's layer.tar is gone")
+                    });
+                    (image, t0.elapsed())
+                });
+                let layer = ingest(env.blobs, &tar, diff_id).map(|l| (l, t0.elapsed()));
+                (
+                    layer,
+                    convert.join().expect("the conversion thread panicked"),
+                )
             });
+            let (layer, ingest_dur) = layer?;
+            ingested = ingest_dur;
+            let (image, convert_dur) = converted;
+            image?;
+            for (name, dur) in [("ingest", ingest_dur), ("convert", convert_dur)] {
+                trace.push(Span {
+                    name: name.into(),
+                    start: trace.at(t0),
+                    dur,
+                    args: Vec::new(),
+                });
+            }
             stage.state.add_layer(layer, &step.text)?;
         }
     }
