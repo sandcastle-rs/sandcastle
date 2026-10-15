@@ -47,16 +47,7 @@ pub fn read(path: &Path) -> Result<Option<GuestEvents>> {
 
 /// The phase names the guest helper emits. Anything else is not trusted
 /// to name a span, so it cannot pose as a host-side span in summaries.
-const PHASES: [&str; 8] = [
-    "store mount",
-    "unpack",
-    "overlay",
-    "command",
-    "copy",
-    "commit",
-    "sync",
-    "unmount",
-];
+const PHASES: [&str; 5] = ["mount", "overlay", "command", "copy", "commit"];
 
 pub fn parse(bytes: &[u8]) -> GuestEvents {
     let mut ev = GuestEvents::default();
@@ -348,7 +339,7 @@ mod tests {
         let ev = parse(
             br#"{"type":"phase","name":"step 9/9 RUN x","start_us":1,"dur_us":2}
 {"type":"phase","name":"ingest","start_us":1,"dur_us":2}
-{"type":"phase","name":"unpack","start_us":1,"dur_us":2}
+{"type":"phase","name":"mount","start_us":1,"dur_us":2}
 {"type":"end","at_us":10}
 "#,
         );
@@ -357,7 +348,7 @@ mod tests {
             &ev,
             &VmTimeline::new(Duration::ZERO, Duration::from_millis(1)),
         );
-        assert!(spans.iter().any(|s| s.name == "unpack"));
+        assert!(spans.iter().any(|s| s.name == "mount"));
         assert!(
             !spans
                 .iter()
@@ -539,7 +530,7 @@ mod tests {
         let max = u64::MAX;
         let input = format!(
             "{{\"type\":\"boot\",\"kernel_boot_us\":{max}}}\n\
-             {{\"type\":\"phase\",\"name\":\"unpack\",\"detail\":\"d\\u202e\",\"start_us\":{max},\"dur_us\":{max}}}\n\
+             {{\"type\":\"phase\",\"name\":\"mount\",\"detail\":\"d\\u202e\",\"start_us\":{max},\"dur_us\":{max}}}\n\
              {{\"type\":\"cmd\",\"text\":\"x\",\"start_us\":{max}}}\n\
              {{\"type\":\"end\",\"at_us\":{max}}}\n"
         );
@@ -550,7 +541,7 @@ mod tests {
         for s in &spans {
             assert!(s.start >= a && s.start + s.dur <= b, "{s:?}");
         }
-        let p = spans.iter().find(|s| s.name == "unpack").unwrap();
+        let p = spans.iter().find(|s| s.name == "mount").unwrap();
         assert_eq!(p.args[0].1, "d\\u{202e}");
     }
 }

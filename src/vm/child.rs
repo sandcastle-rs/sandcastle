@@ -35,7 +35,7 @@ fn try_enter(job_dir: &Path) -> Result<Infallible> {
     // `krun_set_root` would add a 512 MiB DAX window, which the guest spends
     // ~7 ms of boot mapping; the root holds only the helper.
     ctx.add_virtiofs("/dev/root", &spec.guest_root, false)?;
-    ctx.add_disk("store", &spec.disk, false)?;
+    ctx.add_disposable_disk("scratch", &spec.scratch_disk)?;
     for share in &spec.shares {
         ctx.add_virtiofs(&share.tag, &share.path, share.read_only)?;
     }
@@ -132,9 +132,9 @@ fn raise_fd_limit() {
     }
 }
 
-/// The VM keeps the store disk open, so it must not outlive the build that
-/// started it. (The store lock is inherited too, so an orphan never shares
-/// the disk with a new build; this just ends it promptly.) The signal fires
+/// The VM reads the store's layer images, so it must not outlive the build
+/// that started it. (The store lock is inherited too, so a new build never
+/// cleans up under an orphan; this just ends it promptly.) The signal fires
 /// when the spawning *thread* exits, which is the build's main thread.
 #[cfg(target_os = "linux")]
 fn die_with_parent() -> Result<()> {

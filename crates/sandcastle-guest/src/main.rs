@@ -20,15 +20,13 @@ mod commit;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+mod mounts;
+#[cfg(target_os = "linux")]
 mod overlay;
 #[cfg(target_os = "linux")]
 mod probe;
 #[cfg(target_os = "linux")]
 mod run;
-#[cfg(target_os = "linux")]
-mod store;
-#[cfg(target_os = "linux")]
-mod unpack;
 
 #[cfg(target_os = "linux")]
 fn main() {

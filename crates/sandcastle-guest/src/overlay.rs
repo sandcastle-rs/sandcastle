@@ -89,10 +89,6 @@ impl ReadOnlyOverlay {
     pub fn merged(&self) -> &Path {
         &self.merged
     }
-
-    pub fn unmount(self) -> Result<()> {
-        unmount(&self.merged, UnmountFlags::empty()).context("unmounting the source overlay")
-    }
 }
 
 /// Mounts an overlay of `lowers` (top-most first) at `merged`; `upper` is

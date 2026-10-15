@@ -15,15 +15,17 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use sandcastle_proto::{JOB_FILE, Job, SHARE_BLOBS, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status};
+use oci_spec::image::Digest;
+use sandcastle_proto::{JOB_FILE, Job, SHARE_CTX, SHARE_LAYERS, SHARE_OUT, STATUS_FILE, Status};
 use serde::{Deserialize, Serialize};
 
 use self::wait::{Children, Ended};
 use crate::install::Install;
-use crate::store::Store;
+use crate::store::{Store, expand_sparse};
 
 /// VM description the parent writes into the job dir for the `__vm` child.
 pub const SPEC_FILE: &str = "vm.json";
@@ -40,6 +42,12 @@ const MAX_MARKS_BYTES: u64 = 4096;
 pub const PARENT_PID_ENV: &str = "SANDCASTLE_PARENT_PID";
 /// Largest `status.json` read from the guest.
 const MAX_STATUS_BYTES: u64 = 1 << 20;
+/// Most layers one job reads: overlayfs stacks at most 500 lower dirs, and
+/// a job adds one of its own (RUN's mount-point stubs, or the empty bottom
+/// of a `COPY --from` source).
+pub const MAX_LAYERS: usize = 499;
+/// The job's private disk, in its job directory: overlay upper and work dirs.
+const SCRATCH_DISK: &str = "scratch.ext4";
 
 #[cfg(target_os = "linux")]
 const LIB_PATH_ENV: &str = "LD_LIBRARY_PATH";
@@ -58,7 +66,8 @@ pub struct Share {
 pub struct VmSpec {
     pub lib_dir: PathBuf,
     pub guest_root: PathBuf,
-    pub disk: PathBuf,
+    /// The job's private ext4 disk, the guest's only disk (`/dev/vda`).
+    pub scratch_disk: PathBuf,
     pub shares: Vec<Share>,
     pub vcpus: u8,
     pub ram_mib: u32,
@@ -112,7 +121,19 @@ impl<'a> Vm<'a> {
 
 impl Vm<'_> {
     /// Runs `job` in a fresh microVM. `ctx` is shared read-only at `/ctx`.
+    /// Every layer the job reads must have its image in the store.
     pub fn run(&self, job: &Job, ctx: Option<&Path>) -> Result<Finished> {
+        let layers = job.layers();
+        ensure!(
+            layers.len() <= MAX_LAYERS,
+            "the step reads {} layers; overlayfs stacks at most {MAX_LAYERS}",
+            layers.len()
+        );
+        let images = self.store.layer_images();
+        for diff_id in &layers {
+            let path = images.path(&Digest::from_str(diff_id)?)?;
+            ensure!(path.is_file(), "layer {diff_id} has no image in the store");
+        }
         let mut finished = Finished {
             status: Status::default(),
             dir: self.store.new_job_dir()?,
@@ -130,10 +151,13 @@ impl Vm<'_> {
             path: out_dir.clone(),
             read_only: false,
         }];
-        if !matches!(job, Job::Probe { .. }) {
+        // One share for every image, so a job uses the same few virtio
+        // devices however tall its stack: x86_64 libkrun runs out of IRQs
+        // at about a dozen devices.
+        if !layers.is_empty() {
             shares.push(Share {
-                tag: SHARE_BLOBS.into(),
-                path: self.store.blobs_dir(),
+                tag: SHARE_LAYERS.into(),
+                path: self.store.images_dir(),
                 read_only: true,
             });
         }
@@ -144,10 +168,11 @@ impl Vm<'_> {
                 read_only: true,
             });
         }
+        let scratch = finished.dir.join(SCRATCH_DISK);
         let spec = VmSpec {
             lib_dir: self.install.lib_dir.clone(),
             guest_root: self.store.guest_root(),
-            disk: self.store.disk(),
+            scratch_disk: scratch.clone(),
             shares,
             vcpus: self.resources.vcpus,
             ram_mib: self.resources.ram_mib,
@@ -157,6 +182,13 @@ impl Vm<'_> {
         // libkrun dlopens libkrunfw by bare file name; point the loader at the bundle.
         finished.started = Instant::now();
         finished.started_ns = unix_ns();
+        // Part of the VM's start: a fresh disk per job, so no two VMs ever
+        // write the same one.
+        let template = self.install.disk_template();
+        let file =
+            File::open(&template).with_context(|| format!("opening {}", template.display()))?;
+        expand_sparse(zstd::Decoder::new(file)?, &scratch)
+            .with_context(|| format!("creating the scratch disk {}", scratch.display()))?;
         // Without a watch (inotify limits), wait for the process to exit.
         #[cfg(target_os = "linux")]
         let watch = wait::StatusWatch::new(&out_dir).ok();
@@ -329,6 +361,39 @@ pub fn outcome(child_exit: Option<i32>, status: Option<Status>) -> Result<Status
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stack_overlayfs_cannot_hold_fails_before_the_vm_starts() {
+        let (dir, install) = crate::store::test_support::fixture();
+        let store = Store::open(&dir.path().join("store"), &install).unwrap();
+        let vm = Vm::new(
+            Path::new("/nonexistent"),
+            &install,
+            &store,
+            Resources::default(),
+        );
+        let lower = (0..=MAX_LAYERS)
+            .map(|i| sandcastle_proto::LowerLayer {
+                diff_id: format!("sha256:{i:064x}"),
+            })
+            .collect();
+        let job = Job::Run(sandcastle_proto::RunJob {
+            lower,
+            argv: vec!["true".into()],
+            env: vec![],
+            user: String::new(),
+            workdir: "/".into(),
+            resolv_conf: String::new(),
+            shell_form: false,
+        });
+        let err = vm.run(&job, None).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("reads 500 layers; overlayfs stacks at most 499"),
+            "{err:#}"
+        );
+        let jobs = fs::read_dir(store.root().join("jobs")).unwrap().count();
+        assert_eq!(jobs, 0, "no job directory is created");
+    }
 
     #[test]
     fn status_file_wins_over_child_exit_code() {

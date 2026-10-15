@@ -1,6 +1,6 @@
-//! On-disk state: the ext4 store disk, the guest root shared as `/`, and
-//! per-job directories. One process at a time: the ext4 disk cannot be
-//! mounted by two VMs.
+//! On-disk state: blobs, layer images, the guest root shared as `/`, and
+//! per-job directories. One process at a time: each removes what an
+//! earlier run left half written.
 
 use std::fs::{self, File, Permissions, TryLockError};
 use std::io::{ErrorKind, Read};
@@ -16,7 +16,11 @@ use crate::layer_image::LayerImages;
 
 pub use sandcastle_proto::GUEST_HELPER_PATH;
 /// Mount points libkrun's init and the guest helper expect on the root share.
-const GUEST_DIRS: &[&str] = &["dev", "proc", "sys", "tmp", "out", "store", "blobs", "ctx"];
+const GUEST_DIRS: &[&str] = &[
+    "dev", "proc", "sys", "tmp", "out", "scratch", "ctx", "layers",
+];
+/// The ext4 disk all VMs shared before layer images; removed to free its space.
+const OLD_STORE_DISK: &str = "store.ext4";
 /// Largest single template record accepted, bounding the read buffer.
 const MAX_EXTENT: u32 = 64 << 20;
 const TEMPLATE_MAGIC: &[u8; 4] = b"SCX1";
@@ -49,8 +53,8 @@ impl Store {
             Err(TryLockError::Error(e)) => return Err(e).context("locking the store"),
         }
         // `__vm` children inherit the lock, so a VM that outlives this
-        // process keeps the store locked instead of sharing the ext4 disk
-        // with the next build.
+        // process keeps the store locked while it still reads layer images
+        // and its job directory.
         rustix::io::fcntl_setfd(&lock, rustix::io::FdFlags::empty())
             .context("making the store lock inheritable")?;
 
@@ -76,6 +80,12 @@ impl Store {
         }
         fs::create_dir_all(&image_tmp)?;
 
+        match fs::remove_file(root.join(OLD_STORE_DISK)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("removing the old store disk"),
+        }
+
         let store = Self {
             root,
             erofs_converter: install.erofs_converter(),
@@ -83,23 +93,11 @@ impl Store {
             _lock: lock,
         };
         store.prepare_guest_root(&install.guest_bin)?;
-        let disk = store.disk();
-        if !disk.exists() {
-            let template = install.store_template();
-            let file =
-                File::open(&template).with_context(|| format!("opening {}", template.display()))?;
-            expand_sparse(zstd::Decoder::new(file)?, &disk)
-                .with_context(|| format!("creating store disk {}", disk.display()))?;
-        }
         Ok(store)
     }
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    pub fn disk(&self) -> PathBuf {
-        self.root.join("store.ext4")
     }
 
     pub fn guest_root(&self) -> PathBuf {
@@ -114,18 +112,19 @@ impl Store {
         Ok(dir)
     }
 
-    pub fn blobs_dir(&self) -> PathBuf {
-        self.root.join("blobs")
-    }
-
     /// The content-addressed blob store. Borrowing keeps the store lock held.
     pub fn blobs(&self) -> BlobStore<'_> {
-        BlobStore::new(self.blobs_dir())
+        BlobStore::new(self.root.join("blobs"))
     }
 
     /// Erofs images of layers, by diff_id. Borrowing keeps the store lock held.
     pub fn layer_images(&self) -> LayerImages<'_> {
-        LayerImages::new(self.root.join("images"), self.erofs_converter.clone())
+        LayerImages::new(self.images_dir(), self.erofs_converter.clone())
+    }
+
+    /// Where the layer images live; shared read-only with every job's VM.
+    pub(crate) fn images_dir(&self) -> PathBuf {
+        self.root.join("images")
     }
 
     fn prepare_guest_root(&self, helper: &Path) -> Result<()> {
@@ -159,13 +158,13 @@ impl Store {
     }
 }
 
-/// Expands a decoded store template (see `scripts/pack-sparse.py`) into a
+/// Expands a decoded disk template (see `scripts/pack-sparse.py`) into a
 /// sparse file at `dest`. Only listed extents are written; the rest stays a hole.
 pub fn expand_sparse(mut src: impl Read, dest: &Path) -> Result<()> {
     let mut magic = [0u8; 4];
     src.read_exact(&mut magic)
         .context("reading template header")?;
-    ensure!(&magic == TEMPLATE_MAGIC, "not a sandcastle store template");
+    ensure!(&magic == TEMPLATE_MAGIC, "not a sandcastle disk template");
     let mut size = [0u8; 8];
     src.read_exact(&mut size)?;
     let size = u64::from_le_bytes(size);
@@ -209,7 +208,7 @@ fn write_extents(src: &mut impl Read, path: &Path, size: u64) -> Result<()> {
             .context("truncated template extent")?;
         out.write_all_at(&buf, offset)?;
     }
-    out.sync_all()?;
+    // No sync: a scratch disk never outlives its job.
     Ok(())
 }
 

@@ -24,7 +24,7 @@ const PARALLEL_DOWNLOADS: usize = 4;
 /// Largest image config accepted from a registry.
 const MAX_CONFIG_BYTES: u64 = 16 << 20;
 
-/// Largest layer accepted from a registry: the store disk size.
+/// Largest layer accepted from a registry: the scratch disk size.
 const MAX_LAYER_BYTES: u64 = 64 << 30;
 
 /// A base image whose layer blobs are all present in the blob store.

@@ -21,6 +21,8 @@ Modes:
 
 The package cases download from the internet in every run, so they include network time.
 
+sandcastle's store and the build outputs go to `bench/work/`, or to `$BENCH_WORK_DIR` if set. Keep it on a real disk, like a user's store: on tmpfs (`/tmp` on recent Ubuntu) fsync costs nothing, which hides flush costs. `run.sh` warns when the directory is on tmpfs, and `environment.md` records its filesystem.
+
 ## macOS setup
 
 0. Prerequisites: Rust via rustup plus `rustup target add aarch64-unknown-linux-musl`; `just`; `podman`; and `lib/`, from either `just fetch-libs` or `just build-libs` (after `brew install lld xz e2fsprogs zstd autoconf automake libtool pkgconf`). `bench/run.sh` fails early if `lib/` is missing.

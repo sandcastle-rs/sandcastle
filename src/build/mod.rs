@@ -23,7 +23,7 @@ use crate::blobs::BlobStore;
 use crate::dockerfile::{self, Recipe, StageRecipe, Step};
 use crate::image::{self, ConfigState, Layer, LayerWriter};
 use crate::install::{self, Install};
-use crate::layer_image::{self, LayerImages};
+use crate::layer_image::LayerImages;
 use crate::registry;
 use crate::store::Store;
 use crate::trace::{Span, Trace};
@@ -293,11 +293,9 @@ fn pull_images<'a>(
         eprintln!("pulled {} in {:.2}s", u.reference, dur.as_secs_f64());
         step_times.push((format!("pull {}", shown(u.reference)), dur));
         let t0 = Instant::now();
-        for (layer, diff_id) in state.layers.iter().zip(&state.diff_ids) {
-            layer_images
-                .ensure(diff_id, || layer_image::layer_tar(blobs, layer))
-                .with_context(what)?;
-        }
+        layer_images
+            .ensure_state(blobs, &state)
+            .with_context(what)?;
         trace.push(Span {
             name: "convert".into(),
             start: trace.at(t0),
@@ -327,7 +325,7 @@ impl Built<'_> {
             Source::Image(reference) => &self.images[reference.as_str()],
         };
         Ok(CopySource::Layers {
-            lower: state.lower_layers()?,
+            lower: state.lower_layers(),
         })
     }
 }
@@ -364,7 +362,7 @@ fn run_step(
         Action::Metadata => return stage.state.add_empty(&step.text),
         Action::Run { argv, shell_form } => (
             Job::Run(RunJob {
-                lower: stage.state.lower_layers()?,
+                lower: stage.state.lower_layers(),
                 argv,
                 env: stage.run_env(),
                 user: stage.user(),
@@ -381,7 +379,7 @@ fn run_step(
             let ctx = matches!(from, CopySource::Context).then_some(env.context);
             (
                 Job::Copy(CopyJob {
-                    lower: stage.state.lower_layers()?,
+                    lower: stage.state.lower_layers(),
                     sources,
                     dest,
                     workdir: stage.workdir(),
@@ -569,9 +567,9 @@ fn phase_lines(guest: &[Span], ingested: Duration, is_copy: bool, shell_form: bo
         String::new()
     };
     let mut out = format!(
-        "  {early}kernel boot {:.2}s · vmm {vmm} · unpack {:.2}s · {main} {:.2}s · commit {:.2}s · ingest {:.2}s\n",
+        "  {early}kernel boot {:.2}s · vmm {vmm} · mount {:.2}s · {main} {:.2}s · commit {:.2}s · ingest {:.2}s\n",
         sum("kernel boot"),
-        sum("unpack"),
+        sum("mount"),
         sum(main),
         sum("commit"),
         ingested.as_secs_f64()
@@ -659,7 +657,7 @@ mod tests {
         let out = phase_lines(&guest, Duration::from_millis(250), false, true);
         assert_eq!(
             out,
-            "  kernel boot 1.50s · vmm 0.00s · unpack 0.00s · command 3.00s · commit 0.00s · ingest 0.25s\n    2.00s  slow\n    0.01s  fast\n"
+            "  kernel boot 1.50s · vmm 0.00s · mount 0.00s · command 3.00s · commit 0.00s · ingest 0.25s\n    2.00s  slow\n    0.01s  fast\n"
         );
     }
 

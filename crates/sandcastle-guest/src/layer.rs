@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use tar::{EntryType, Header};
@@ -19,50 +19,6 @@ pub const OPAQUE_XATTR: &str = "trusted.overlay.opaque";
 pub const OVERLAY_XATTR_PREFIX: &str = "trusted.overlay.";
 /// PAX record prefix for extended attributes (GNU tar, Docker).
 pub const XATTR_PAX_PREFIX: &str = "SCHILY.xattr.";
-
-/// What a layer tar path means once OCI whiteout names are decoded.
-#[derive(Debug, PartialEq, Eq)]
-pub enum TarPath {
-    /// The layer root itself (`./`); carries no change.
-    Root,
-    Plain(PathBuf),
-    /// `dir/.wh.name`: `dir/name` is deleted.
-    Whiteout(PathBuf),
-    /// `dir/.wh..wh..opq`: lower contents of `dir` are hidden.
-    Opaque(PathBuf),
-}
-
-/// Normalises a tar path to a relative one and decodes whiteout names.
-/// Paths that climb out of the layer root are refused.
-pub fn classify(raw: &Path) -> io::Result<TarPath> {
-    let mut clean = PathBuf::new();
-    for component in raw.components() {
-        match component {
-            Component::Normal(name) => clean.push(name),
-            Component::CurDir | Component::RootDir => {}
-            Component::ParentDir | Component::Prefix(_) => {
-                return Err(invalid(raw, "leaves the layer root"));
-            }
-        }
-    }
-    let Some(name) = clean.file_name() else {
-        return Ok(TarPath::Root);
-    };
-    let Some(name) = name.to_str() else {
-        return Ok(TarPath::Plain(clean));
-    };
-    if name == OPAQUE_MARKER {
-        let dir = clean.parent().unwrap_or(Path::new("")).to_path_buf();
-        return Ok(TarPath::Opaque(dir));
-    }
-    if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) {
-        if target.is_empty() || target == "." || target == ".." {
-            return Err(invalid(raw, "is not a valid whiteout"));
-        }
-        return Ok(TarPath::Whiteout(clean.with_file_name(target)));
-    }
-    Ok(TarPath::Plain(clean))
-}
 
 fn invalid(path: &Path, why: &str) -> io::Error {
     io::Error::new(
@@ -234,33 +190,6 @@ impl<W: Write> Write for HashWriter<W> {
     }
 }
 
-/// Passes bytes through from `inner`, hashing them.
-pub struct HashReader<R> {
-    inner: R,
-    hasher: Sha256,
-}
-
-impl<R> HashReader<R> {
-    pub fn new(inner: R) -> Self {
-        Self {
-            inner,
-            hasher: Sha256::new(),
-        }
-    }
-
-    pub fn finish(self) -> (R, String) {
-        (self.inner, to_digest(self.hasher))
-    }
-}
-
-impl<R: Read> Read for HashReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
-    }
-}
-
 fn to_digest(hasher: Sha256) -> String {
     let mut s = String::from("sha256:");
     for b in hasher.finalize() {
@@ -269,18 +198,20 @@ fn to_digest(hasher: Sha256) -> String {
     s
 }
 
-/// The hex part of a `sha256:<64 lowercase hex>` digest. Anything else is
-/// refused, so a digest is always safe to use as a file name.
-pub fn digest_hex(digest: &str) -> io::Result<&str> {
-    digest
+/// File name of a layer's image on the `layers` share: the hex of a
+/// `sha256:<64 lowercase hex>` diff_id plus `.erofs`. Anything else is
+/// refused, so a job can't name a path outside the share.
+pub fn image_name(diff_id: &str) -> io::Result<String> {
+    diff_id
         .strip_prefix("sha256:")
         .filter(|hex| {
             hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
         })
+        .map(|hex| format!("{hex}.erofs"))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("invalid digest {digest:?}"),
+                format!("invalid diff_id {diff_id:?}"),
             )
         })
 }
@@ -302,18 +233,64 @@ pub fn overlay_stack(bottom_first: &[String]) -> Vec<&str> {
 mod tests {
     use std::io::Read;
 
+    use std::path::Component;
+
     use super::*;
 
+    /// What a layer tar path means once OCI whiteout names are decoded.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum TarPath {
+        /// The layer root itself (`./`); carries no change.
+        Root,
+        Plain(PathBuf),
+        /// `dir/.wh.name`: `dir/name` is deleted.
+        Whiteout(PathBuf),
+        /// `dir/.wh..wh..opq`: lower contents of `dir` are hidden.
+        Opaque(PathBuf),
+    }
+
+    /// Decodes the whiteout names `append` writes, as an unpacker would.
+    pub fn classify(raw: &Path) -> io::Result<TarPath> {
+        let mut clean = PathBuf::new();
+        for component in raw.components() {
+            match component {
+                Component::Normal(name) => clean.push(name),
+                Component::CurDir | Component::RootDir => {}
+                Component::ParentDir | Component::Prefix(_) => {
+                    return Err(invalid(raw, "leaves the layer root"));
+                }
+            }
+        }
+        let Some(name) = clean.file_name() else {
+            return Ok(TarPath::Root);
+        };
+        let Some(name) = name.to_str() else {
+            return Ok(TarPath::Plain(clean));
+        };
+        if name == OPAQUE_MARKER {
+            let dir = clean.parent().unwrap_or(Path::new("")).to_path_buf();
+            return Ok(TarPath::Opaque(dir));
+        }
+        if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) {
+            if target.is_empty() || target == "." || target == ".." {
+                return Err(invalid(raw, "is not a valid whiteout"));
+            }
+            return Ok(TarPath::Whiteout(clean.with_file_name(target)));
+        }
+        Ok(TarPath::Plain(clean))
+    }
+
     #[test]
-    fn classify_maps_oci_names() {
-        let c = |p: &str| classify(Path::new(p)).unwrap();
-        assert_eq!(c("./etc/.wh.motd"), TarPath::Whiteout("etc/motd".into()));
-        assert_eq!(c("usr/.wh..wh..opq"), TarPath::Opaque("usr".into()));
-        assert_eq!(c(".wh..wh..opq"), TarPath::Opaque("".into()));
-        assert_eq!(c("/abs/file"), TarPath::Plain("abs/file".into()));
-        assert_eq!(c("./"), TarPath::Root);
-        assert!(classify(Path::new("a/../../etc/passwd")).is_err());
-        assert!(classify(Path::new("dir/.wh.")).is_err());
+    fn image_names_accept_only_sha256_hex_diff_ids() {
+        let hex = "a".repeat(64);
+        assert_eq!(
+            image_name(&format!("sha256:{hex}")).unwrap(),
+            format!("{hex}.erofs")
+        );
+        assert!(image_name("sha256:../../etc/passwd").is_err());
+        assert!(image_name(&format!("sha512:{hex}")).is_err());
+        assert!(image_name(&format!("sha256:{}", "A".repeat(64))).is_err());
+        assert!(image_name(&format!("sha256:{hex}/")).is_err());
     }
 
     fn meta(mode: u32) -> Meta {
@@ -448,15 +425,6 @@ mod tests {
             digest,
             "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-    }
-
-    #[test]
-    fn digest_hex_rejects_other_shapes() {
-        let ok = format!("sha256:{}", "a".repeat(64));
-        assert_eq!(digest_hex(&ok).unwrap(), "a".repeat(64));
-        assert!(digest_hex("sha256:../../etc").is_err());
-        assert!(digest_hex(&format!("sha512:{}", "a".repeat(64))).is_err());
-        assert!(digest_hex(&format!("sha256:{}", "A".repeat(64))).is_err());
     }
 
     #[test]

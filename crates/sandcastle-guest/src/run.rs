@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::copy::resolve_in_root;
 use crate::events::Recorder;
 use crate::linux::{commit_upper, phase};
+use crate::mounts::Mounts;
 use crate::overlay::Overlay;
-use crate::store::Store;
 use crate::trace_filter::MarkerFilter;
 use crate::user;
 
@@ -70,10 +70,14 @@ struct ExecSpec {
     groups: Vec<u32>,
 }
 
-pub fn run_job(store: &Store, job: &RunJob, out: &Path, rec: Option<&Recorder>) -> Result<Status> {
-    store.ensure_layers(&job.lower, rec)?;
-    let work = store.work("run")?;
-    let mut lowers = store.lower_dirs(&job.lower)?;
+pub fn run_job(
+    mounts: &Mounts,
+    job: &RunJob,
+    out: &Path,
+    rec: Option<&Recorder>,
+) -> Result<Status> {
+    let work = mounts.work("run")?;
+    let mut lowers = mounts.lower_dirs(&job.lower)?;
     lowers.push(stub_layer(&work)?);
     write_etc(&job.resolv_conf)?;
     let overlay = phase(rec, "overlay", None, || Overlay::mount(&lowers, &work))?;
@@ -81,13 +85,12 @@ pub fn run_job(store: &Store, job: &RunJob, out: &Path, rec: Option<&Recorder>) 
     let upper = overlay.unmount()?;
     let exit_code = result?;
     if exit_code != 0 {
-        fs::remove_dir_all(&upper)?;
         return Ok(Status {
             exit_code,
             ..Default::default()
         });
     }
-    commit_upper(store, &upper, out, rec)
+    commit_upper(&upper, out, rec)
 }
 
 /// Bottom-most lower layer providing mount points, so binds never create
@@ -336,7 +339,7 @@ fn setup(spec: &ExecSpec) -> Result<()> {
 }
 
 /// Makes `root` the process's root and detaches the VM's old root, which still
-/// has the store mounted. Unlike `chroot`, this cannot be escaped with a
+/// has the VM's disks mounted. Unlike `chroot`, this cannot be escaped with a
 /// nested chroot: the old root is no longer in the mount namespace.
 fn enter_root(root: &Path) -> Result<()> {
     std::env::set_current_dir(root)?;
@@ -374,8 +377,7 @@ fn mask_proc(root: &Path) -> Result<()> {
 }
 
 /// Removes every capability outside `ALLOWED_CAPS`. Without this a root step
-/// could mknod the store disk, or mount things, and poison cached layers of
-/// other images. The inheritable set stays empty, as in runc, so nothing is
+/// could mknod the VM's disks, or mount things. The inheritable set stays empty, as in runc, so nothing is
 /// inherited across exec. This deliberately deviates from Docker: a step cannot mknod.
 fn drop_capabilities() -> Result<()> {
     for cap in 0..u64::BITS {

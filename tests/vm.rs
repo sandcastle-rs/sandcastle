@@ -62,13 +62,25 @@ fn guest_exit_127_comes_from_status_file() {
 
 const BUSYBOX: &str = "mirror.gcr.io/library/busybox:1.36";
 
-/// Pulls busybox into the store and returns its layer stack.
+/// Pulls busybox into the store, builds its layer images and returns its
+/// layer stack.
 fn busybox(store: &Store) -> Vec<LowerLayer> {
-    let image = registry::pull(&store.blobs(), BUSYBOX).unwrap();
-    ConfigState::from_base(&image.config, image.layers)
-        .unwrap()
-        .lower_layers()
-        .unwrap()
+    let blobs = store.blobs();
+    let image = registry::pull(&blobs, BUSYBOX).unwrap();
+    let state = ConfigState::from_base(&image.config, image.layers).unwrap();
+    store.layer_images().ensure_state(&blobs, &state).unwrap();
+    state.lower_layers()
+}
+
+/// Builds the image of the layer a job left in `out`, as a build does.
+fn image_of_output(store: &Store, finished: &sandcastle::vm::Finished) -> LowerLayer {
+    let diff_id = finished.status.layer.clone().expect("a layer");
+    let tar = finished.out_dir().join(LAYER_FILE);
+    store
+        .layer_images()
+        .ensure(&diff_id.parse().unwrap(), || Ok(std::fs::File::open(&tar)?))
+        .unwrap();
+    LowerLayer { diff_id }
 }
 
 /// path → (entry type, uid, contents or link target) of the job's layer.tar.
@@ -201,19 +213,6 @@ fn copy_job_missing_source_is_a_guest_error() {
     );
 }
 
-/// Copies every blob of `from` into `to`, so `to` can unpack the layers.
-fn copy_blobs(from: &Store, to: &Store) {
-    let (src, dst) = (
-        from.blobs_dir().join("sha256"),
-        to.blobs_dir().join("sha256"),
-    );
-    std::fs::create_dir_all(&dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
-    }
-}
-
 fn copy_from_layers(lower: Vec<LowerLayer>, source: Vec<LowerLayer>, from: &str) -> Job {
     Job::Copy(CopyJob {
         lower,
@@ -227,12 +226,12 @@ fn copy_from_layers(lower: Vec<LowerLayer>, source: Vec<LowerLayer>, from: &str)
 #[test]
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
 fn copy_from_layers_sees_the_merged_view_and_keeps_owners() {
-    let (_dir_a, exe, install, store_a) = store();
-    let vm = Vm::new(&exe, &install, &store_a, Resources::default());
-    let base = busybox(&store_a);
+    let (_dir, exe, install, store) = store();
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
+    let base = busybox(&store);
     let (_, stack) = run_step(
         &vm,
-        &store_a,
+        &store,
         &base,
         &run_job(
             base.clone(),
@@ -242,7 +241,7 @@ fn copy_from_layers_sees_the_merged_view_and_keeps_owners() {
     );
     let (_, source) = run_step(
         &vm,
-        &store_a,
+        &store,
         &stack,
         &run_job(
             stack.clone(),
@@ -251,15 +250,9 @@ fn copy_from_layers_sees_the_merged_view_and_keeps_owners() {
             "",
         ),
     );
-
-    // A second store has the blobs but no unpacked layers: both stacks are
-    // prepared in the COPY job itself.
-    let (_dir_b, _, _, store_b) = store();
-    copy_blobs(&store_a, &store_b);
-    let dest = busybox(&store_b);
-    let vm = Vm::new(&exe, &install, &store_b, Resources::default());
+    // The destination shares busybox's layer with the source: one disk.
     let finished = vm
-        .run(&copy_from_layers(dest, source, "/src"), None)
+        .run(&copy_from_layers(base, source, "/src"), None)
         .unwrap();
     assert_eq!(finished.status.exit_code, 0);
     let events = std::fs::read(finished.out_dir().join(EVENTS_FILE)).unwrap();
@@ -328,22 +321,8 @@ fn run_step(
 ) -> (sandcastle::vm::Finished, Vec<LowerLayer>) {
     let finished = vm.run(job, None).unwrap();
     let mut stack = lower.to_vec();
-    if let Some(diff_id) = &finished.status.layer {
-        // Ingest the layer so later jobs can find it as a blob too.
-        let blobs = store.blobs();
-        let mut writer = sandcastle::image::LayerWriter::new(&blobs).unwrap();
-        std::io::copy(
-            &mut std::fs::File::open(finished.out_dir().join(LAYER_FILE)).unwrap(),
-            &mut writer,
-        )
-        .unwrap();
-        let layer = writer.finish().unwrap();
-        assert_eq!(layer.diff_id.to_string(), *diff_id);
-        stack.push(LowerLayer {
-            diff_id: diff_id.clone(),
-            blob: layer.descriptor.digest().to_string(),
-            media_type: sandcastle_proto::LAYER_TAR_GZIP.into(),
-        });
+    if finished.status.layer.is_some() {
+        stack.push(image_of_output(store, &finished));
     }
     (finished, stack)
 }
@@ -491,20 +470,7 @@ fn run_survives_resolv_conf_symlink() {
     });
     let finished = vm.run(&copy, Some(&ctx)).unwrap();
     let mut stack = base;
-    let diff_id = finished.status.layer.clone().unwrap();
-    let blobs = store.blobs();
-    let mut writer = sandcastle::image::LayerWriter::new(&blobs).unwrap();
-    std::io::copy(
-        &mut std::fs::File::open(finished.out_dir().join(LAYER_FILE)).unwrap(),
-        &mut writer,
-    )
-    .unwrap();
-    let layer = writer.finish().unwrap();
-    stack.push(LowerLayer {
-        diff_id,
-        blob: layer.descriptor.digest().to_string(),
-        media_type: sandcastle_proto::LAYER_TAR_GZIP.into(),
-    });
+    stack.push(image_of_output(&store, &finished));
     let status = vm
         .run(&run_job(stack, "echo ok > /ok", ""), None)
         .unwrap()
@@ -530,15 +496,15 @@ fn run_creating_a_reserved_whiteout_name_fails_the_step() {
 
 #[test]
 #[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
-fn run_cannot_reach_the_store_disk() {
+fn run_cannot_reach_the_vm_mounts() {
     let (_dir, exe, install, store) = store();
     let vm = Vm::new(&exe, &install, &store, Resources::default());
     let base = busybox(&store);
     let script = "mknod /tmp/vda b 254 0 2>/dev/null || echo blocked > /m1; \
                   mkdir -p /mnt; mount -t tmpfs none /mnt 2>/dev/null || echo blocked > /m2; \
                   touch /f && chown 65534 /f && echo ok > /m3; \
-                  grep -c ' /store' /proc/self/mountinfo > /m4; \
-                  test ! -e /store/layers && echo ok > /m6; \
+                  grep -cE ' /(scratch|layers)' /proc/self/mountinfo > /m4; \
+                  test ! -e /scratch/layers && echo ok > /m6; \
                   echo x > /proc/sys/kernel/core_pattern 2>/dev/null || echo blocked > /m5";
     let (finished, _) = run_step(&vm, &store, &base, &run_job(base.clone(), script, ""));
     assert_eq!(finished.status.exit_code, 0);
@@ -554,7 +520,7 @@ fn run_cannot_reach_the_store_disk() {
     assert_eq!(entries["m2"].2, b"blocked\n");
     assert_eq!(
         entries["m4"].2, b"0\n",
-        "the store is still mounted in the step"
+        "the scratch disk or the layer images are still mounted in the step"
     );
     assert_eq!(entries["m5"].2, b"blocked\n");
 }
@@ -630,7 +596,7 @@ fn traced_chain_reports_the_failing_command_last() {
             _ => None,
         })
         .collect();
-    for p in ["store mount", "overlay", "command", "unmount"] {
+    for p in ["mount", "overlay", "command"] {
         assert!(phases.contains(&p), "{p} missing from {phases:?}");
     }
     assert!(matches!(ev.first(), Some(Event::Boot { .. })));
@@ -697,4 +663,76 @@ fn traced_run_finishes_with_a_leftover_background_process() {
     let finished = vm.run(&job, None).unwrap();
     assert_eq!(finished.status.exit_code, 0);
     assert!(finished.status.layer.is_some());
+}
+
+/// A tar whose entries are (path, mode, uid, contents).
+fn tar_of(entries: &[(&str, u32, u64, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for &(path, mode, uid, data) in entries {
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(mode);
+        header.set_uid(uid);
+        header.set_gid(uid);
+        header.set_size(data.len() as u64);
+        builder.append_data(&mut header, path, data).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+/// Past both device limits a disk per layer hit: about 120 virtio devices
+/// on macOS, about a dozen on x86_64.
+const LONG_STACK: usize = 150;
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn a_tall_stack_is_stacked_in_order_and_images_stay_unchanged() {
+    let (_dir, exe, install, store) = store();
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
+    let images = store.layer_images();
+    let mut stack = busybox(&store);
+    for i in 0..LONG_STACK {
+        let (n, f) = (format!("{i}\n"), format!("f{i:02}"));
+        let mut entries: Vec<(&str, u32, u64, &[u8])> =
+            vec![("n", 0o644, 0, n.as_bytes()), (&f, 0o644, 0, b"")];
+        if i == 0 {
+            entries.push(("suid", 0o4755, 1000, b""));
+        }
+        if i == 10 {
+            entries.push((".wh.f03", 0o644, 0, b""));
+        }
+        let layer = tar_of(&entries);
+        let diff_id = sandcastle::blobs::sha256(&layer);
+        images
+            .ensure(&diff_id, || Ok(std::io::Cursor::new(layer)))
+            .unwrap();
+        stack.push(LowerLayer {
+            diff_id: diff_id.to_string(),
+        });
+    }
+    let paths: Vec<PathBuf> = stack
+        .iter()
+        .map(|l| images.path(&l.diff_id.parse().unwrap()).unwrap())
+        .collect();
+    let before: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+    let script = "cat /n > /top; ls / | grep -c '^f[0-9]' > /count; \
+                  stat -c '%a %u' /suid > /suid-mode; test -e /f03 || echo gone > /wh";
+    let (finished, _) = run_step(&vm, &store, &stack, &run_job(stack.clone(), script, ""));
+    assert_eq!(finished.status.exit_code, 0);
+    let entries = layer_entries(&finished.out_dir());
+    let top = format!("{}\n", LONG_STACK - 1);
+    assert_eq!(entries["top"].2, top.as_bytes(), "the top layer wins");
+    assert_eq!(
+        entries["count"].2,
+        format!("{}\n", LONG_STACK - 1).as_bytes()
+    );
+    assert_eq!(entries["suid-mode"].2, b"4755 1000\n");
+    assert_eq!(
+        entries["wh"].2, b"gone\n",
+        "a whiteout in a higher layer hides f03"
+    );
+
+    let after: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    assert!(before == after, "a job changed a layer image");
 }

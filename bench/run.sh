@@ -41,7 +41,18 @@ sandcastle="$REPO_DIR/target/release/sandcastle"
 [[ -x "$sandcastle" ]] || { echo "run \`just build\` first" >&2; exit 1; }
 [[ -d "$REPO_DIR/lib" ]] || { echo "lib/ is missing; run \`just build-libs\` or \`just fetch-libs\`" >&2; exit 1; }
 export SANDCASTLE_LIBKRUN_DIR="$REPO_DIR/lib"
-work="$(mktemp -d "${TMPDIR:-/tmp}/sandcastle-bench.XXXXXX")"
+# The store must sit on a real disk like a user's: on tmpfs (/tmp on many
+# distros) every fsync is free, which hides flush costs.
+work_parent="${BENCH_WORK_DIR:-$BENCH_DIR/work}"
+mkdir -p "$work_parent"
+work="$(mktemp -d "$work_parent/sandcastle-bench.XXXXXX")"
+work_fs=apfs
+if [[ "$(uname -s)" == Linux ]]; then
+    work_fs="$(findmnt -no FSTYPE -T "$work")"
+    if [[ "$work_fs" == tmpfs ]]; then
+        echo "warning: $work is on tmpfs; set BENCH_WORK_DIR to a directory on disk" >&2
+    fi
+fi
 trap 'rm -rf "$work"; "$BENCH_DIR/buildkit.sh" stop' EXIT
 stamp="$(date +%Y%m%d-%H%M%S)-$(hostname -s)"
 results="$BENCH_DIR/results/$stamp"
@@ -70,6 +81,7 @@ fi
     echo "- cpu: $(if [[ "$(uname -s)" == Darwin ]]; then sysctl -n machdep.cpu.brand_string; else grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-; fi)"
     echo "- sandcastle: $(git -C "$REPO_DIR" describe --always --dirty)"
     echo "- sandcastle per-step VM: $host_cpus CPU / 2048 MiB"
+    echo "- sandcastle store: $work ($work_fs)"
     echo "- buildkit: $BUILDKIT_IMAGE via $ENGINE ($($ENGINE --version))"
     echo "- buildkit engine VM: $engine_vm"
     echo "- hyperfine: $(hyperfine --version)"

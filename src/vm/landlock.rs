@@ -36,7 +36,7 @@ pub fn restrict(spec: &VmSpec) -> Result<()> {
     let enforced = restrict_paths(&Rules {
         rw_dirs: &rw_dirs,
         ro_dirs: &ro_dirs,
-        rw_files: &[spec.disk.as_path()],
+        rw_files: &[spec.scratch_disk.as_path()],
         devices: &[Path::new("/dev/kvm")],
     })?;
     if !enforced {
