@@ -1,5 +1,6 @@
 /target
 /lib
 /bench/results/*/
+/bench/work/
 /bench/cases/large-copy/data/
 /bench/cases/large-copy/data.tmp.*/
