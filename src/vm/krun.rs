@@ -21,6 +21,11 @@ pub const LIBKRUN_FILE: &str = "libkrun.1.dylib";
 
 /// `krun_set_log_level`: errors only.
 const LOG_LEVEL_ERROR: u32 = 1;
+/// `krun_add_disk3`: the image is a plain file of disk blocks.
+const DISK_FORMAT_RAW: u32 = 0;
+/// `krun_add_disk3`: no `VIRTIO_BLK_F_FLUSH`, so the guest never makes the
+/// host sync the image.
+const SYNC_NONE: u32 = 0;
 /// libkrun reads exactly this many pointers from `argv`/`envp`
 /// (`slice::from_raw_parts(ptr, MAX_ARGS)` in v1.19.6), so arrays are padded
 /// with NULL to this length to keep its read in bounds.
@@ -30,7 +35,8 @@ type CreateCtxFn = unsafe extern "C" fn() -> i32;
 type SetLogLevelFn = unsafe extern "C" fn(u32) -> i32;
 type SetVmConfigFn = unsafe extern "C" fn(u32, u8, u32) -> i32;
 type SetPathFn = unsafe extern "C" fn(u32, *const c_char) -> i32;
-type AddDiskFn = unsafe extern "C" fn(u32, *const c_char, *const c_char, bool) -> i32;
+type AddDiskFn =
+    unsafe extern "C" fn(u32, *const c_char, *const c_char, u32, bool, bool, u32) -> i32;
 type AddVirtiofsFn = unsafe extern "C" fn(u32, *const c_char, *const c_char, u64, bool) -> i32;
 type SetExecFn =
     unsafe extern "C" fn(u32, *const c_char, *const *const c_char, *const *const c_char) -> i32;
@@ -67,7 +73,7 @@ impl Krun {
                 set_log_level: symbol(&lib, c"krun_set_log_level")?,
                 set_vm_config: symbol(&lib, c"krun_set_vm_config")?,
                 set_workdir: symbol(&lib, c"krun_set_workdir")?,
-                add_disk: symbol(&lib, c"krun_add_disk")?,
+                add_disk: symbol(&lib, c"krun_add_disk3")?,
                 add_virtiofs: symbol(&lib, c"krun_add_virtiofs3")?,
                 set_exec: symbol(&lib, c"krun_set_exec")?,
                 start_enter: symbol(&lib, c"krun_start_enter")?,
@@ -131,13 +137,26 @@ impl Ctx<'_> {
         .map(drop)
     }
 
-    pub fn add_disk(&mut self, block_id: &str, image: &Path, read_only: bool) -> Result<()> {
+    /// Attaches a raw disk image that nothing needs after the VM: guest
+    /// flushes are not offered, so writes stay in the host's page cache.
+    /// Syncing a freshly written scratch disk on its first flush cost ~17 ms
+    /// per step on Linux.
+    pub fn add_disposable_disk(&mut self, block_id: &str, image: &Path) -> Result<()> {
         let block_id = CString::new(block_id)?;
         let image = path_cstring(image)?;
         // SAFETY: both strings are NUL-terminated and outlive the call; libkrun copies them.
-        let rc =
-            unsafe { (self.krun.add_disk)(self.id, block_id.as_ptr(), image.as_ptr(), read_only) };
-        check(rc, "krun_add_disk").map(drop)
+        let rc = unsafe {
+            (self.krun.add_disk)(
+                self.id,
+                block_id.as_ptr(),
+                image.as_ptr(),
+                DISK_FORMAT_RAW,
+                false,
+                false,
+                SYNC_NONE,
+            )
+        };
+        check(rc, "krun_add_disk3").map(drop)
     }
 
     /// Passes `shm_size` 0: no DAX window.

@@ -35,7 +35,7 @@ fn try_enter(job_dir: &Path) -> Result<Infallible> {
     // `krun_set_root` would add a 512 MiB DAX window, which the guest spends
     // ~7 ms of boot mapping; the root holds only the helper.
     ctx.add_virtiofs("/dev/root", &spec.guest_root, false)?;
-    ctx.add_disk("scratch", &spec.scratch_disk, false)?;
+    ctx.add_disposable_disk("scratch", &spec.scratch_disk)?;
     for share in &spec.shares {
         ctx.add_virtiofs(&share.tag, &share.path, share.read_only)?;
     }
