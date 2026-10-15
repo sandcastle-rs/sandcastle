@@ -262,6 +262,8 @@ fn copy_from_layers_sees_the_merged_view_and_keeps_owners() {
         .run(&copy_from_layers(dest, source, "/src"), None)
         .unwrap();
     assert_eq!(finished.status.exit_code, 0);
+    let events = std::fs::read(finished.out_dir().join(EVENTS_FILE)).unwrap();
+    assert_eq!(sandcastle::build::events::parse(&events).malformed, 0);
     let entries = layer_entries(&finished.out_dir());
     assert_eq!(
         entries["out/f"],

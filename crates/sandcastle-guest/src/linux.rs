@@ -138,7 +138,9 @@ fn copy_job(store: &Store, job: &CopyJob, out: &Path, rec: Option<&Recorder>) ->
         None => None,
         Some(lower) => {
             let (lowers, work) = (store.lower_dirs(lower)?, store.work("copy-src")?);
-            Some(phase(rec, "source overlay", None, || {
+            // The host only trusts known phase names; the detail tells
+            // this overlay from the destination's.
+            Some(phase(rec, "overlay", Some("source"), || {
                 ReadOnlyOverlay::mount(&lowers, &work)
             })?)
         }
