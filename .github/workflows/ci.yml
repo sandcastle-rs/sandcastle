@@ -34,10 +34,12 @@ jobs:
           grep -qF "libkrunfw $LIBKRUNFW_TAG " lib/PROVENANCE
           grep -qF "erofs-utils $EROFS_UTILS_VERSION " lib/PROVENANCE
           test -x lib/mkfs.erofs
+      # Artifacts drop file modes; a tar inside keeps mkfs.erofs executable.
+      - run: tar -cf sandcastle-libs.tar -C lib .
       - uses: actions/upload-artifact@v4
         with:
           name: sandcastle-libs-${{ matrix.platform }}
-          path: lib
+          path: sandcastle-libs.tar
 
   test:
     strategy:
@@ -62,7 +64,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: sandcastle-libs-linux-x86_64
-          path: lib
+      - run: mkdir lib && tar -xf sandcastle-libs.tar -C lib
       - name: Allow the runner user to use /dev/kvm
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -82,7 +84,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: sandcastle-libs-linux-x86_64
-          path: lib
+      - run: mkdir lib && tar -xf sandcastle-libs.tar -C lib
       - run: sudo apt-get update && sudo apt-get install -y skopeo
       - uses: taiki-e/install-action@just
       - run: rustup target add x86_64-unknown-linux-musl

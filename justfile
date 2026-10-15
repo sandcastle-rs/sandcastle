@@ -36,9 +36,13 @@ build-libs:
     scripts/build-libs.sh {{lib_dir}}
 
 # Download the bundle of the latest CI run into lib/ (needs a GitHub remote).
+# The artifact is a tar, which keeps mkfs.erofs executable.
 fetch-libs:
-    rm -rf {{lib_dir}}
-    gh run download --name sandcastle-libs-{{platform}} --dir {{lib_dir}}
+    rm -rf {{lib_dir}} {{lib_dir}}.download
+    gh run download --name sandcastle-libs-{{platform}} --dir {{lib_dir}}.download
+    mkdir {{lib_dir}}
+    tar -xf {{lib_dir}}.download/sandcastle-libs.tar -C {{lib_dir}}
+    rm -rf {{lib_dir}}.download
     cd {{lib_dir}} && shasum -a 256 -c SHA256SUMS
 
 # Run a built image with podman (Linux CI): needs podman and skopeo.
