@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build the bundled libkrun + libkrunfw + ext4 store template for this
-# platform into the directory given as $1 (default: ./lib).
+# Build the bundled libkrun + libkrunfw + ext4 store template + mkfs.erofs
+# for this platform into the directory given as $1 (default: ./lib).
 #
-# macOS needs: brew install lld xz e2fsprogs zstd
-# Linux needs: apt-get install patchelf libc6-dev e2fsprogs zstd binutils clang libclang-dev
+# macOS needs: brew install lld xz e2fsprogs zstd autoconf automake libtool pkgconf
+# Linux needs: apt-get install patchelf libc6-dev e2fsprogs zstd binutils clang libclang-dev autoconf automake libtool pkg-config
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -115,9 +115,62 @@ else
 fi
 python3 "$here/pack-sparse.py" "$work/store.ext4" | zstd -q -19 -o "$out/store-template.ext4.zst"
 
+# mkfs.erofs from erofs-utils, for converting layer tars to erofs images.
+# The host feeds it uncompressed tars, so every optional library is left
+# out: only libc (and pthreads) is linked. On Linux it is linked statically:
+# glibc 2.38+ headers redirect its strtoul calls to __isoc23_* symbols, so a
+# dynamic build on a newer distro would not run on older ones. It uses no
+# NSS (getpwnam, getaddrinfo, ...), which static glibc can't serve.
+fetch "https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-$EROFS_UTILS_VERSION.tar.gz" \
+    "$EROFS_UTILS_SRC_SHA256" "$work/erofs-utils.tgz"
+tar -xzf "$work/erofs-utils.tgz" -C "$work"
+erofs_src="$work/erofs-utils-$EROFS_UTILS_VERSION"
+(
+    cd "$erofs_src"
+    ./autogen.sh >/dev/null
+    # option-checking=fatal: a misspelt --without-* is otherwise ignored,
+    # and the library it names gets linked if the build host has it.
+    ./configure --quiet --enable-option-checking=fatal --disable-lz4 --disable-lzma \
+        --without-zlib --without-libdeflate --without-libzstd --without-qpl --without-xxhash \
+        --without-libcurl --without-openssl --without-libxml2 --without-json-c \
+        --without-libnl3 --disable-ublk --disable-s3 --disable-oci --disable-fanotify \
+        --disable-fuse --without-uuid --without-selinux
+)
+make -C "$erofs_src/lib" -j"$(ncpu)" >/dev/null
+case "$os" in
+# libtool's -all-static (a plain -static only prefers static libtool libs).
+Linux) make -C "$erofs_src/mkfs" -j"$(ncpu)" LDFLAGS=-all-static >/dev/null ;;
+*) make -C "$erofs_src/mkfs" -j"$(ncpu)" >/dev/null ;;
+esac
+erofs_bin="$out/mkfs.erofs"
+cp "$erofs_src/mkfs/mkfs.erofs" "$erofs_bin"
+# MIT, with GPL-2.0-only headers compiled in (hashmap.h, flex-array.h).
+cp "$erofs_src/COPYING" "$out/licenses/COPYING-erofs-utils"
+cp "$erofs_src/LICENSES/GPL-2.0" "$out/licenses/LICENSE-erofs-utils-GPL-2.0"
+cp "$erofs_src/LICENSES/MIT" "$out/licenses/LICENSE-erofs-utils-MIT"
+case "$os" in
+Darwin)
+    if otool -L "$erofs_bin" | tail -n +2 | grep -vE '^\s+(/usr/lib/|/System/)'; then
+        echo "mkfs.erofs links non-system libraries (listed above)" >&2; exit 1
+    fi
+    ;;
+Linux)
+    if objdump -p "$erofs_bin" | grep -qE '^\s*(INTERP|DYNAMIC)\b'; then
+        objdump -p "$erofs_bin" | awk '/NEEDED/ {print "  needs " $2}' >&2
+        echo "mkfs.erofs is not statically linked" >&2; exit 1
+    fi
+    # glibc is linked in, so its license ships too.
+    cp /usr/share/common-licenses/LGPL-2.1 "$out/licenses/LICENSE-glibc-LGPL-2.1"
+    ;;
+esac
+
 {
     echo "libkrun $LIBKRUN_TAG source sha256 $LIBKRUN_SRC_SHA256 (https://github.com/containers/libkrun)"
     echo "libkrunfw $LIBKRUNFW_TAG (https://github.com/containers/libkrunfw/tree/$LIBKRUNFW_TAG)"
+    echo "erofs-utils $EROFS_UTILS_VERSION source sha256 $EROFS_UTILS_SRC_SHA256 (https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git)"
+    if [ "$os" = Linux ]; then
+        echo "mkfs.erofs statically links $(ldd --version | head -1)"
+    fi
     for p in "$here"/patches/libkrun-*.patch; do
         echo "libkrun patch $(basename "$p") sha256 $(shasum -a 256 "$p" | cut -d' ' -f1)"
     done

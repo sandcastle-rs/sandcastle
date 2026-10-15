@@ -6,6 +6,7 @@ pub mod dockerfile;
 pub mod doctor;
 pub mod image;
 pub mod install;
+pub mod layer_image;
 mod pargz;
 pub mod registry;
 pub mod store;
