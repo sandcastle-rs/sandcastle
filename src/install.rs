@@ -14,6 +14,8 @@ pub const GUEST_ENV: &str = "SANDCASTLE_GUEST";
 pub const ROOT_ENV: &str = "SANDCASTLE_ROOT";
 
 const STORE_TEMPLATE: &str = "store-template.ext4.zst";
+/// Converts layer tars to erofs layer images (erofs-utils, see `lib/PROVENANCE`).
+const EROFS_CONVERTER: &str = "mkfs.erofs";
 const GUEST_BIN: &str = "sandcastle-guest";
 
 /// Absolute paths of the files shipped next to the `sandcastle` executable.
@@ -49,6 +51,10 @@ impl Install {
 
     pub fn store_template(&self) -> PathBuf {
         self.lib_dir.join(STORE_TEMPLATE)
+    }
+
+    pub fn erofs_converter(&self) -> PathBuf {
+        self.lib_dir.join(EROFS_CONVERTER)
     }
 }
 

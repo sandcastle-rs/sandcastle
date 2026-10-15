@@ -31,7 +31,7 @@ it-registry:
     cargo build --release -p sandcastle-guest --target {{guest_target}}
     SANDCASTLE_LIBKRUN_DIR={{lib_dir}} SANDCASTLE_GUEST={{justfile_directory()}}/target/{{guest_target}}/release/sandcastle-guest cargo test --release -p sandcastle --test registry -- --ignored --test-threads=1
 
-# Build the libkrun/libkrunfw/store-template bundle into lib/.
+# Build the libkrun/libkrunfw/store-template/mkfs.erofs bundle into lib/.
 build-libs:
     scripts/build-libs.sh {{lib_dir}}
 
