@@ -454,3 +454,157 @@ fn failed_build_still_reports_timings_and_trace() {
         assert!(names.contains(&n), "{n} missing: {names:?}");
     }
 }
+
+/// Builds the multi-stage fixture into a new layout; `extra` picks a target.
+fn build_multi_stage(extra: &[&str]) -> (tempfile::TempDir, Output) {
+    let out = tempfile::tempdir().unwrap();
+    let output = build_with(&fixture("multi-stage"), None, out.path(), extra);
+    (out, output)
+}
+
+fn env_of(layout: &Layout) -> Vec<String> {
+    let config = layout.config.config().as_ref().unwrap();
+    config.env().clone().unwrap_or_default()
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn multi_stage_build_exports_only_the_final_stage() {
+    let (out, output) = build_multi_stage(&[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("does-not-exist"), "{stderr}");
+    assert!(!stderr.contains("[broken]"), "{stderr}");
+    let late = stderr.find("[late] FROM").expect("late stage ran");
+    let assets = stderr.find("[assets] FROM").expect("assets stage ran");
+    assert!(
+        late < assets,
+        "a COPY --from dependency runs first: {stderr}"
+    );
+
+    let layout = Layout::open(out.path());
+    assert_eq!(
+        layout.config.architecture(),
+        &oci_spec::image::Arch::default()
+    );
+    assert_eq!(layout.config.os(), &oci_spec::image::Os::Linux);
+    let config = layout.config.config().as_ref().unwrap();
+    assert_eq!(config.env(), &None, "no stage's ENV leaks into scratch");
+    assert_eq!(config.working_dir().as_deref(), Some("/app"));
+    assert_eq!(
+        config.cmd().as_deref(),
+        Some(&["cat".to_string(), "/app/out.txt".to_string()][..])
+    );
+    let history: Vec<String> = layout
+        .config
+        .history()
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|h| h.created_by().clone().unwrap())
+        .collect();
+    assert_eq!(
+        history.len(),
+        9,
+        "only the final stage's steps: {history:?}"
+    );
+    assert_eq!(history[0], "WORKDIR /app");
+
+    // One layer per COPY; nothing from the stages copied from.
+    assert_eq!(layout.manifest.layers().len(), 6);
+    let layers: Vec<_> = (0..6).map(|i| layout.layer(i)).collect();
+    for (i, layer) in layers.iter().enumerate() {
+        for leaked in ["src", "junk", "etc", "base"] {
+            assert!(!layer.contains_key(leaked), "{leaked} in layer {i}");
+        }
+    }
+    let file = |i: usize, path: &str| {
+        let (kind, uid, body, mode) = &layers[i][path];
+        (*kind, *uid, body.clone(), mode & 0o7777)
+    };
+    let built = (tar::EntryType::Regular, 1000, b"built\n".to_vec(), 0o644);
+    assert_eq!(file(0, "app/out.txt"), built, "owner kept, WORKDIR applied");
+    assert_eq!(layers[0]["app"].1, 0, "created parent dirs are root's");
+    assert_eq!(file(1, "same.txt"), built);
+    assert_eq!(
+        layout.config.rootfs().diff_ids()[1],
+        layout.config.rootfs().diff_ids()[2],
+        "--from=builder and --from=1 copy the same thing"
+    );
+    let busybox = file(3, "bin/busybox");
+    assert_eq!(
+        (busybox.0, busybox.1, busybox.3),
+        (tar::EntryType::Regular, 0, 0o755)
+    );
+    assert!(busybox.2.starts_with(b"\x7fELF"));
+    assert_eq!(file(4, "late.txt").2, b"late\n");
+    assert_eq!(
+        file(5, "hello.txt"),
+        (
+            tar::EntryType::Regular,
+            0,
+            b"hello from the context\n".to_vec(),
+            0o644
+        )
+    );
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn target_exports_a_stage_and_its_inherited_state() {
+    let (builder_out, output) = build_multi_stage(&["--target", "builder"]);
+    assert!(output.status.success());
+    let (sibling_out, output) = build_multi_stage(&["--target", "Sibling"]);
+    assert!(output.status.success());
+    let builder = Layout::open(builder_out.path());
+    let sibling = Layout::open(sibling_out.path());
+
+    let builder_env = env_of(&builder);
+    for kv in ["FROM_BASE=1", "FROM_BUILDER=1"] {
+        assert!(builder_env.contains(&kv.to_string()), "{builder_env:?}");
+    }
+    assert!(!builder_env.iter().any(|e| e.starts_with("SIBLING=")));
+    let sibling_env = env_of(&sibling);
+    for kv in ["FROM_BASE=1", "SIBLING=1"] {
+        assert!(sibling_env.contains(&kv.to_string()), "{sibling_env:?}");
+    }
+    assert!(!sibling_env.iter().any(|e| e.starts_with("FROM_BUILDER=")));
+    let workdir = |l: &Layout| l.config.config().as_ref().unwrap().working_dir().clone();
+    assert_eq!(workdir(&builder).as_deref(), Some("/src"));
+    assert_eq!(workdir(&sibling).as_deref(), Some("/base"));
+
+    // Both start from base's layers; only builder's RUN adds one.
+    let (b, s) = (builder.manifest.layers(), sibling.manifest.layers());
+    assert_eq!(b.len(), s.len() + 1);
+    assert_eq!(&b[..s.len()], &s[..]);
+
+    let (_out, output) = build_multi_stage(&["--target", "broken"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("line 15: FROM mirror.gcr.io/library/does-not-exist:never"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("RUN false"),
+        "nothing runs after a failed pull: {stderr}"
+    );
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn copy_from_a_missing_path_names_the_stage_and_path() {
+    let ctx = tempfile::tempdir().unwrap();
+    let output = build_dockerfile(
+        ctx.path(),
+        "FROM mirror.gcr.io/library/alpine:3.20 AS tools\nFROM scratch\nCOPY --from=tools /nope /x\n",
+        &[],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[stage 1] COPY --from=tools /nope /x")
+            && stderr.contains("/nope: not found in the source image"),
+        "{stderr}"
+    );
+}

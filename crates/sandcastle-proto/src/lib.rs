@@ -100,13 +100,27 @@ pub struct RunJob {
     pub shell_form: bool,
 }
 
-/// A `COPY` step from the build context (shared at `/ctx`). `lower` is bottom first.
+/// A `COPY` step. `lower` is the destination's stack, bottom first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CopyJob {
     pub lower: Vec<LowerLayer>,
     pub sources: Vec<String>,
     pub dest: String,
     pub workdir: String,
+    #[serde(default)]
+    pub source: CopySource,
+}
+
+/// Where a `COPY` reads its sources from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CopySource {
+    /// The build context, shared at `/ctx`; files are owned by root.
+    #[default]
+    Context,
+    /// The merged filesystem of a stage or image (`COPY --from`), bottom
+    /// first; files keep their owners.
+    Layers { lower: Vec<LowerLayer> },
 }
 
 /// Result written by the guest helper. Authoritative over the VM process
@@ -178,6 +192,7 @@ mod tests {
 
     #[test]
     fn copy_job_wire_format() {
+        // Jobs written before `source` existed copy from the context.
         let job: Job = serde_json::from_str(
             r#"{"mode":"copy","lower":[],"sources":["a","b/"],"dest":"/x/","workdir":"/app"}"#,
         )
@@ -189,8 +204,23 @@ mod tests {
                 sources: vec!["a".into(), "b/".into()],
                 dest: "/x/".into(),
                 workdir: "/app".into(),
+                source: CopySource::Context,
             })
         );
+    }
+
+    #[test]
+    fn copy_from_layers_wire_format() {
+        let json = r#"{"mode":"copy","lower":[],"sources":["/out/app"],"dest":"/app","workdir":"/","source":{"kind":"layers","lower":[{"diff_id":"sha256:aa","blob":"sha256:bb","media_type":"application/vnd.oci.image.layer.v1.tar"}]}}"#;
+        let job: Job = serde_json::from_str(json).unwrap();
+        let Job::Copy(copy) = &job else {
+            panic!("not a copy job")
+        };
+        let CopySource::Layers { lower } = &copy.source else {
+            panic!("not a layers source")
+        };
+        assert_eq!(lower[0].diff_id, "sha256:aa");
+        assert_eq!(serde_json::to_string(&job).unwrap(), json);
     }
 
     #[test]

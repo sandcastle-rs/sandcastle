@@ -8,14 +8,14 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use rustix::mount::{MountFlags, mount};
 use sandcastle_proto::{
-    CopyJob, EVENTS_FILE, JOB_FILE, Job, KMSG_ENV, KMSG_FILE, LAYER_FILE, MAX_KMSG_BYTES,
-    SHARE_CTX, SHARE_OUT, STATUS_FILE, Status,
+    CopyJob, CopySource, EVENTS_FILE, JOB_FILE, Job, KMSG_ENV, KMSG_FILE, LAYER_FILE,
+    MAX_KMSG_BYTES, SHARE_CTX, SHARE_OUT, STATUS_FILE, Status,
 };
 
 use crate::commit;
-use crate::copy::Copy;
+use crate::copy::{Copy, Owner};
 use crate::events::Recorder;
-use crate::overlay::Overlay;
+use crate::overlay::{Overlay, ReadOnlyOverlay};
 use crate::store::Store;
 
 pub const OUT: &str = "/out";
@@ -112,30 +112,80 @@ pub fn with_store(
 }
 
 fn copy_job(store: &Store, job: &CopyJob, out: &Path, rec: Option<&Recorder>) -> Result<Status> {
-    mount(
-        SHARE_CTX,
-        CTX,
-        "virtiofs",
-        MountFlags::RDONLY,
-        None::<&CStr>,
-    )
-    .context("mounting the build context")?;
-    store.ensure_layers(&job.lower, rec)?;
-    let work = store.work("copy")?;
-    let lowers = store.lower_dirs(&job.lower)?;
-    let overlay = phase(rec, "overlay", None, || Overlay::mount(&lowers, &work))?;
-    let copy = Copy {
-        ctx: Path::new(CTX),
-        root: overlay.merged(),
-        workdir: &job.workdir,
-        owner: Some((0, 0)),
+    let source_lower = match &job.source {
+        CopySource::Context => {
+            mount(
+                SHARE_CTX,
+                CTX,
+                "virtiofs",
+                MountFlags::RDONLY,
+                None::<&CStr>,
+            )
+            .context("mounting the build context")?;
+            None
+        }
+        CopySource::Layers { lower } => Some(lower),
+    };
+    // One call prepares both stacks: each call mounts the blob share.
+    let mut layers = job.lower.clone();
+    for l in source_lower.into_iter().flatten() {
+        if !layers.iter().any(|d| d.diff_id == l.diff_id) {
+            layers.push(l.clone());
+        }
+    }
+    store.ensure_layers(&layers, rec)?;
+    let source = match source_lower {
+        None => None,
+        Some(lower) => {
+            let (lowers, work) = (store.lower_dirs(lower)?, store.work("copy-src")?);
+            // The host only trusts known phase names; the detail tells
+            // this overlay from the destination's.
+            Some(phase(rec, "overlay", Some("source"), || {
+                ReadOnlyOverlay::mount(&lowers, &work)
+            })?)
+        }
+    };
+    // Both overlays come down before the store does, whatever fails.
+    let dest = store
+        .work("copy")
+        .and_then(|work| Ok((store.lower_dirs(&job.lower)?, work)))
+        .and_then(|(lowers, work)| phase(rec, "overlay", None, || Overlay::mount(&lowers, &work)));
+    let overlay = match dest {
+        Ok(overlay) => overlay,
+        Err(e) => {
+            if let Some(source) = source
+                && let Err(u) = source.unmount()
+            {
+                eprintln!("sandcastle-guest: {u:#}");
+            }
+            return Err(e);
+        }
+    };
+    let copy = match &source {
+        None => Copy {
+            src_root: Path::new(CTX),
+            src_name: "the build context",
+            root: overlay.merged(),
+            workdir: &job.workdir,
+            owner: Owner::Fixed(0, 0),
+        },
+        Some(source) => Copy {
+            src_root: source.merged(),
+            src_name: "the source image",
+            root: overlay.merged(),
+            workdir: &job.workdir,
+            owner: Owner::Source,
+        },
     };
     let result = phase(rec, "copy", None, || {
         copy.ensure_workdir()
             .and_then(|()| copy.run(&job.sources, &job.dest))
     });
-    let upper = overlay.unmount()?;
+    let upper = overlay.unmount();
+    let source_unmounted = source.map_or(Ok(()), ReadOnlyOverlay::unmount);
     result?;
+    let upper = upper?;
+    source_unmounted?;
     commit_upper(store, &upper, out, rec)
 }
 

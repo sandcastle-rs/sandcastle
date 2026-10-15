@@ -297,6 +297,21 @@ mod tests {
     }
 
     #[test]
+    fn derived_stage_entrypoint_clears_cmd_set_by_its_parent() {
+        let mut parent = stage();
+        apply(&mut parent, "CMD [\"serve\"]\nENTRYPOINT [\"/entry\"]\n").unwrap();
+        assert_eq!(parent.state.cmd, Some(vec!["serve".into()]));
+
+        let mut child = Stage::new(parent.state.clone(), '\\');
+        apply(&mut child, "ENTRYPOINT [\"/other\"]\n").unwrap();
+        assert_eq!(child.state.cmd, None);
+
+        let mut child = Stage::new(parent.state.clone(), '\\');
+        apply(&mut child, "CMD [\"run\"]\nENTRYPOINT [\"/other\"]\n").unwrap();
+        assert_eq!(child.state.cmd, Some(vec!["run".into()]));
+    }
+
+    #[test]
     fn copy_expands_and_checks_multi_source_dest() {
         let mut s = stage();
         let actions = apply(&mut s, "ENV F=a.txt\nCOPY $F /dst\n").unwrap();

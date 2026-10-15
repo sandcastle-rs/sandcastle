@@ -53,6 +53,9 @@ enum Command {
         /// Output OCI layout directory (created or updated in place).
         #[arg(short, long)]
         output: PathBuf,
+        /// Stage to build and export, by name [default: the last stage].
+        #[arg(long, value_name = "NAME")]
+        target: Option<String>,
         /// vCPUs per build-step VM [default: all host CPUs].
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..))]
         cpus: Option<u8>,
@@ -90,6 +93,7 @@ fn main() -> ExitCode {
             file,
             tag,
             output,
+            target,
             cpus,
             memory,
             timings,
@@ -106,6 +110,7 @@ fn main() -> ExitCode {
                 context,
                 output,
                 tag,
+                target,
                 resources,
                 timings,
                 trace,

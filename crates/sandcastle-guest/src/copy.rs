@@ -1,5 +1,6 @@
-//! Docker `COPY` from the build context into an image root. Paths resolve
-//! as if each root were `/`. Uses only std, so the rules test on any host.
+//! Docker `COPY` from a source root (the build context or an image) into an
+//! image root. Paths resolve as if each root were `/`. Uses only std, so the
+//! rules test on any host.
 
 use std::ffi::OsString;
 use std::fs::{self, File, FileTimes, FileType, Metadata, Permissions};
@@ -156,13 +157,14 @@ fn last_name(path: &Path) -> Option<OsString> {
     parts(path).pop().filter(|n| n != "..")
 }
 
-/// Sources in the context for one COPY argument, sorted.
-fn expand_source(ctx: &Path, source: &str) -> Result<Vec<Source>> {
+/// Sources in `root` for one COPY argument, sorted; `name` says what
+/// `root` is in errors.
+fn expand_source(root: &Path, name: &str, source: &str) -> Result<Vec<Source>> {
     if !has_meta(source) {
-        let path = resolve_in_root(ctx, Path::new(source))?;
+        let path = resolve_in_root(root, Path::new(source))?;
         ensure!(
             fs::symlink_metadata(&path).is_ok(),
-            "{source}: not found in the build context"
+            "{source}: not found in {name}"
         );
         return Ok(vec![(path, last_name(Path::new(source)))]);
     }
@@ -176,7 +178,7 @@ fn expand_source(ctx: &Path, source: &str) -> Result<Vec<Source>> {
                 up.pop();
                 next.push(up);
             } else if has_meta(&part_str) {
-                let Ok(entries) = fs::read_dir(resolve_in_root(ctx, base)?) else {
+                let Ok(entries) = fs::read_dir(resolve_in_root(root, base)?) else {
                     continue;
                 };
                 let mut names: Vec<OsString> = entries
@@ -198,32 +200,60 @@ fn expand_source(ctx: &Path, source: &str) -> Result<Vec<Source>> {
     }
     let mut out = Vec::new();
     for rel in current {
-        let path = resolve_in_root(ctx, &rel)?;
+        let path = resolve_in_root(root, &rel)?;
         if fs::symlink_metadata(&path).is_ok() {
             out.push((path, last_name(&rel)));
         }
     }
-    ensure!(
-        !out.is_empty(),
-        "{source}: no files in the build context match"
-    );
+    ensure!(!out.is_empty(), "{source}: no files in {name} match");
     Ok(out)
 }
 
-/// One COPY step: `ctx` is the build context, `root` the image root.
+/// Who owns what a COPY writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    /// These ids, for everything written.
+    Fixed(u32, u32),
+    /// Each copied entry keeps its source's ids; directories created for
+    /// the destination get the process's own (root in the guest).
+    Source,
+}
+
+impl Owner {
+    /// Ids to set on a copy of an entry with metadata `src`.
+    fn of_copy(self, src: &Metadata) -> Option<(u32, u32)> {
+        match self {
+            Owner::Source => Some((src.uid(), src.gid())),
+            owner => owner.fixed(),
+        }
+    }
+
+    /// Ids set regardless of the source: on every write for `Fixed`, and
+    /// on the parent directories the destination needs.
+    fn fixed(self) -> Option<(u32, u32)> {
+        match self {
+            Owner::Fixed(uid, gid) => Some((uid, gid)),
+            Owner::Source => None,
+        }
+    }
+}
+
+/// One COPY step: sources resolve in `src_root` as if it were `/`,
+/// destinations in the image root `root`.
 pub struct Copy<'a> {
-    pub ctx: &'a Path,
+    pub src_root: &'a Path,
+    /// What `src_root` is, for errors: "the build context".
+    pub src_name: &'a str,
     pub root: &'a Path,
     pub workdir: &'a str,
-    /// Owner for everything written; `None` keeps the process's own ids.
-    pub owner: Option<(u32, u32)>,
+    pub owner: Owner,
 }
 
 impl Copy<'_> {
     pub fn run(&self, sources: &[String], dest: &str) -> Result<()> {
         let mut srcs = Vec::new();
         for source in sources {
-            srcs.extend(expand_source(self.ctx, source)?);
+            srcs.extend(expand_source(self.src_root, self.src_name, source)?);
         }
         let into_dir = dest.ends_with('/') || dest == "." || dest.ends_with("/.") || srcs.len() > 1;
         let target = resolve_in_root(self.root, &Path::new(self.workdir).join(dest))?;
@@ -267,7 +297,7 @@ impl Copy<'_> {
                 Ok(_) => bail!("{} is not a directory", self.shown(&cur)),
                 Err(e) if e.kind() == ErrorKind::NotFound => {
                     fs::create_dir(&cur)?;
-                    self.chown(&cur)?;
+                    chown(&cur, self.owner.fixed())?;
                     fs::set_permissions(&cur, Permissions::from_mode(0o755))?;
                 }
                 Err(e) => return Err(e.into()),
@@ -349,7 +379,13 @@ impl Copy<'_> {
             }
         } else if ft.is_symlink() {
             symlink(fs::read_link(src)?, &dst)?;
-            self.chown(&dst)?;
+            // Only source ownership needs the link's own metadata: a stat
+            // costs a virtio-fs round trip when copying from the context.
+            let ids = match self.owner {
+                Owner::Source => self.owner.of_copy(&fs::symlink_metadata(src)?),
+                owner => owner.fixed(),
+            };
+            chown(&dst, ids)?;
         } else {
             eprintln!("sandcastle-guest: skipping special file {}", src.display());
         }
@@ -396,16 +432,9 @@ impl Copy<'_> {
 
     /// Owner first (chown clears setuid bits), then mtime, then mode.
     fn finish(&self, path: &Path, meta: &Metadata) -> Result<()> {
-        self.chown(path)?;
+        chown(path, self.owner.of_copy(meta))?;
         File::open(path)?.set_times(FileTimes::new().set_modified(meta.modified()?))?;
         fs::set_permissions(path, Permissions::from_mode(meta.mode() & 0o7777))?;
-        Ok(())
-    }
-
-    fn chown(&self, path: &Path) -> Result<()> {
-        if let Some((uid, gid)) = self.owner {
-            lchown(path, Some(uid), Some(gid))?;
-        }
         Ok(())
     }
 
@@ -417,6 +446,14 @@ impl Copy<'_> {
     }
 }
 
+/// Sets the owner of `path` itself, not of a link target.
+fn chown(path: &Path, ids: Option<(u32, u32)>) -> Result<()> {
+    if let Some((uid, gid)) = ids {
+        lchown(path, Some(uid), Some(gid))?;
+    }
+    Ok(())
+}
+
 /// A regular file created by the walk, waiting for its data.
 struct Fill {
     src: PathBuf,
@@ -425,12 +462,12 @@ struct Fill {
 
 impl Fill {
     /// Owner first (chown clears setuid bits), then mtime, then mode.
-    fn run(mut self, owner: Option<(u32, u32)>) -> Result<()> {
+    fn run(mut self, owner: Owner) -> Result<()> {
         let mut from = File::open(&self.src)?;
         let meta = from.metadata()?;
         io::copy(&mut from, &mut self.to)
             .with_context(|| format!("copying {}", self.src.display()))?;
-        if let Some((uid, gid)) = owner {
+        if let Some((uid, gid)) = owner.of_copy(&meta) {
             fchown(&self.to, Some(uid), Some(gid))?;
         }
         self.to
@@ -476,11 +513,37 @@ mod tests {
 
     fn copy<'a>(f: &'a Fixture, workdir: &'a str) -> Copy<'a> {
         Copy {
-            ctx: &f.ctx,
+            src_root: &f.ctx,
+            src_name: "the build context",
             root: &f.root,
             workdir,
-            owner: None,
+            // Without root, a host test can only keep its own ids.
+            owner: Owner::Source,
         }
+    }
+
+    #[test]
+    fn image_source_resolves_from_its_root_and_is_named_in_errors() {
+        let f = fixture();
+        let image = Copy {
+            src_name: "the source image",
+            ..copy(&f, "/srv")
+        };
+        image
+            .run(&["/tree/sub/../a.txt".into(), "tree/sub".into()], "./")
+            .unwrap();
+        assert_eq!(fs::read_to_string(f.root.join("srv/a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(f.root.join("srv/b.txt")).unwrap(), "b");
+        let err = image.run(&["nope".into()], "/x").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("nope: not found in the source image"),
+            "{err:#}"
+        );
+        let err = image.run(&["*.rs".into()], "/x/").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("*.rs: no files in the source image match"),
+            "{err:#}"
+        );
     }
 
     #[test]

@@ -54,6 +54,28 @@ pub struct ConfigState {
 }
 
 impl ConfigState {
+    /// An empty Linux image for `FROM scratch`: no layers, history, or config.
+    pub fn scratch(architecture: Arch) -> Self {
+        Self {
+            architecture,
+            os: Os::Linux,
+            variant: None,
+            os_version: None,
+            env: Vec::new(),
+            cmd: None,
+            entrypoint: None,
+            working_dir: None,
+            user: None,
+            labels: BTreeMap::new(),
+            exposed_ports: BTreeSet::new(),
+            volumes: BTreeSet::new(),
+            stop_signal: None,
+            history: Vec::new(),
+            layers: Vec::new(),
+            diff_ids: Vec::new(),
+        }
+    }
+
     /// Starts from a base image's config and its manifest layers.
     pub fn from_base(config: &ImageConfiguration, layers: Vec<Descriptor>) -> Result<Self> {
         let diff_ids = config
@@ -637,6 +659,30 @@ mod tests {
         assert_eq!(index.manifests().len(), 1);
         assert_eq!(index.manifests()[0].digest(), second.digest());
         read_verified(&out, &index.manifests()[0]);
+    }
+
+    #[test]
+    fn scratch_writes_an_empty_linux_image() {
+        let (dir, store) = test_support::store();
+        let blobs = store.blobs();
+        let state = ConfigState::scratch(Arch::Amd64);
+        let out = dir.path().join("out");
+        let entry = write_layout(&blobs, &state, &out, "demo").unwrap();
+
+        let manifest = ImageManifest::from_reader(&read_verified(&out, &entry)[..]).unwrap();
+        assert!(manifest.layers().is_empty());
+        let config: serde_json::Value =
+            serde_json::from_slice(&read_verified(&out, manifest.config())).unwrap();
+        assert_eq!(
+            config,
+            serde_json::json!({
+                "architecture": "amd64",
+                "os": "linux",
+                "config": {},
+                "rootfs": {"type": "layers", "diff_ids": []},
+                "history": []
+            })
+        );
     }
 
     #[test]

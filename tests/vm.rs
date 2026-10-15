@@ -9,7 +9,9 @@ use sandcastle::install::Install;
 use sandcastle::registry;
 use sandcastle::store::Store;
 use sandcastle::vm::{Resources, Vm};
-use sandcastle_proto::{CopyJob, EVENTS_FILE, Event, Job, LAYER_FILE, LowerLayer, RunJob, Status};
+use sandcastle_proto::{
+    CopyJob, CopySource, EVENTS_FILE, Event, Job, LAYER_FILE, LowerLayer, RunJob, Status,
+};
 
 fn sandcastle_bin() -> PathBuf {
     std::env::var_os("SANDCASTLE_BIN")
@@ -110,6 +112,7 @@ fn copy_job_writes_context_files_as_root() {
         sources: vec!["hello.txt".into(), "tree".into()],
         dest: "/app/".into(),
         workdir: "/srv".into(),
+        source: CopySource::Context,
     });
     let vm = Vm::new(&exe, &install, &store, Resources::default());
     let finished = vm.run(&job, Some(&ctx)).unwrap();
@@ -163,6 +166,7 @@ fn copy_job_with_more_files_than_the_soft_fd_limit() {
         sources: vec![".".into()],
         dest: "/data/".into(),
         workdir: "/".into(),
+        source: CopySource::Context,
     });
     let vm = Vm::new(&exe, &install, &store, Resources::default());
     let finished = vm.run(&job, Some(&ctx)).unwrap();
@@ -187,12 +191,119 @@ fn copy_job_missing_source_is_a_guest_error() {
         sources: vec!["nope.txt".into()],
         dest: "/x".into(),
         workdir: "/".into(),
+        source: CopySource::Context,
     });
     let vm = Vm::new(&exe, &install, &store, Resources::default());
     let err = vm.run(&job, Some(&ctx)).err().unwrap();
     assert!(
         format!("{err:#}").contains("nope.txt: not found in the build context"),
         "{err:#}"
+    );
+}
+
+/// Copies every blob of `from` into `to`, so `to` can unpack the layers.
+fn copy_blobs(from: &Store, to: &Store) {
+    let (src, dst) = (
+        from.blobs_dir().join("sha256"),
+        to.blobs_dir().join("sha256"),
+    );
+    std::fs::create_dir_all(&dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+    }
+}
+
+fn copy_from_layers(lower: Vec<LowerLayer>, source: Vec<LowerLayer>, from: &str) -> Job {
+    Job::Copy(CopyJob {
+        lower,
+        sources: vec![from.into()],
+        dest: "/out/".into(),
+        workdir: "/".into(),
+        source: CopySource::Layers { lower: source },
+    })
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn copy_from_layers_sees_the_merged_view_and_keeps_owners() {
+    let (_dir_a, exe, install, store_a) = store();
+    let vm = Vm::new(&exe, &install, &store_a, Resources::default());
+    let base = busybox(&store_a);
+    let (_, stack) = run_step(
+        &vm,
+        &store_a,
+        &base,
+        &run_job(
+            base.clone(),
+            "mkdir -p /src/d && echo old > /src/f && touch /src/gone /src/d/a",
+            "",
+        ),
+    );
+    let (_, source) = run_step(
+        &vm,
+        &store_a,
+        &stack,
+        &run_job(
+            stack.clone(),
+            "echo new > /src/f && chown 1000:1001 /src/f && rm /src/gone \
+             && rm -rf /src/d && mkdir /src/d && touch /src/d/b && ln -s /src/f /src/abs",
+            "",
+        ),
+    );
+
+    // A second store has the blobs but no unpacked layers: both stacks are
+    // prepared in the COPY job itself.
+    let (_dir_b, _, _, store_b) = store();
+    copy_blobs(&store_a, &store_b);
+    let dest = busybox(&store_b);
+    let vm = Vm::new(&exe, &install, &store_b, Resources::default());
+    let finished = vm
+        .run(&copy_from_layers(dest, source, "/src"), None)
+        .unwrap();
+    assert_eq!(finished.status.exit_code, 0);
+    let events = std::fs::read(finished.out_dir().join(EVENTS_FILE)).unwrap();
+    assert_eq!(sandcastle::build::events::parse(&events).malformed, 0);
+    let entries = layer_entries(&finished.out_dir());
+    assert_eq!(
+        entries["out/f"],
+        (tar::EntryType::Regular, 1000, b"new\n".to_vec())
+    );
+    assert_eq!(entries["out/d/b"].1, 0);
+    assert_eq!(
+        entries["out/abs"],
+        (tar::EntryType::Symlink, 0, b"/src/f".to_vec())
+    );
+    for hidden in ["out/gone", "out/d/a", "src"] {
+        assert!(
+            !entries.contains_key(hidden),
+            "{hidden}: {:?}",
+            entries.keys()
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs bundled libkrun, a hypervisor and network; run with `just it`"]
+fn failed_copy_from_layers_leaves_the_store_usable() {
+    let (_dir, exe, install, store) = store();
+    let base = busybox(&store);
+    let vm = Vm::new(&exe, &install, &store, Resources::default());
+    let err = vm
+        .run(&copy_from_layers(base.clone(), base.clone(), "/nope"), None)
+        .err()
+        .unwrap();
+    assert!(
+        format!("{err:#}").contains("/nope: not found in the source image"),
+        "{err:#}"
+    );
+    let finished = vm
+        .run(&copy_from_layers(base.clone(), base, "/bin/busybox"), None)
+        .unwrap();
+    assert_eq!(finished.status.exit_code, 0);
+    assert_eq!(
+        layer_entries(&finished.out_dir())["out/busybox"].0,
+        tar::EntryType::Regular
     );
 }
 
@@ -376,6 +487,7 @@ fn run_survives_resolv_conf_symlink() {
         sources: vec!["root".into()],
         dest: "/".into(),
         workdir: "/".into(),
+        source: CopySource::Context,
     });
     let finished = vm.run(&copy, Some(&ctx)).unwrap();
     let mut stack = base;
@@ -562,6 +674,7 @@ fn exec_form_and_copy_jobs_still_record_phases() {
         sources: vec!["a".into()],
         dest: "/a".into(),
         workdir: "/".into(),
+        source: CopySource::Context,
     });
     let finished = vm.run(&copy, Some(&ctx)).unwrap();
     let ev = events(&finished.out_dir());
