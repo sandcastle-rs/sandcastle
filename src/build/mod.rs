@@ -1,23 +1,25 @@
-//! `sandcastle build`: pull the base, apply each instruction, run RUN and
-//! COPY in microVMs, and write the image as an OCI layout.
+//! `sandcastle build`: pull the images the target needs, build its stages in
+//! dependency order, run RUN and COPY in microVMs, and write the target
+//! stage as an OCI layout.
 
 pub mod config;
 pub mod dns;
 pub mod events;
 pub mod plan;
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use oci_spec::image::Descriptor;
+use oci_spec::image::{Arch, Descriptor};
 use sandcastle_proto::{
     CopyJob, CopySource, EVENTS_FILE, Job, KMSG_FILE, LAYER_FILE, MAX_KMSG_BYTES, RunJob,
 };
 
 use crate::blobs::BlobStore;
-use crate::dockerfile::{self, Step};
+use crate::dockerfile::{self, Recipe, StageRecipe, Step};
 use crate::image::{self, ConfigState, Layer, LayerWriter};
 use crate::install::{self, Install};
 use crate::registry;
@@ -25,6 +27,7 @@ use crate::store::Store;
 use crate::trace::{Span, Trace};
 use crate::vm::{self, Finished, Resources, Vm};
 use config::{Action, Stage};
+use plan::{Base, BuildPlan, Source};
 
 /// Longest instruction text shown in progress and error messages.
 const SHOWN_CHARS: usize = 60;
@@ -34,6 +37,8 @@ pub struct Options {
     pub context: PathBuf,
     pub output: PathBuf,
     pub tag: String,
+    /// Stage to build and export; the last stage when `None`.
+    pub target: Option<String>,
     pub resources: Resources,
     /// Print each step's phases and a summary sorted by duration.
     pub timings: bool,
@@ -82,10 +87,12 @@ fn timed<T>(trace: &mut Trace, name: &str, f: impl FnOnce() -> T) -> T {
 }
 
 fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descriptor> {
-    // Unsupported instructions fail here, before any download or VM.
+    // Unsupported instructions and bad stage references fail here, before
+    // any download or VM.
     let recipe = timed(trace, "parse", || dockerfile::load(&opts.dockerfile))?;
-    let plan = timed(trace, "plan", || plan::resolve(&recipe, None))?;
-    let stage_recipe = &recipe.stages[plan.target];
+    let plan = timed(trace, "plan", || {
+        plan::resolve(&recipe, opts.target.as_deref())
+    })?;
     let context = std::fs::canonicalize(&opts.context)
         .with_context(|| format!("build context {}", opts.context.display()))?;
     ensure!(
@@ -101,20 +108,8 @@ fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descript
     })?;
     let blobs = store.blobs();
 
-    let total = stage_recipe.steps.len() + 1;
-    eprintln!("[1/{total}] FROM {}", stage_recipe.base);
-    let t0 = Instant::now();
-    let image = timed(trace, "pull", || registry::pull(&blobs, &stage_recipe.base))?;
-    let pulled = t0.elapsed();
-    eprintln!("[1/{total}] done in {:.2}s", pulled.as_secs_f64());
-    let mut step_times = vec![(
-        format!("step 1/{total} FROM {}", shown(&stage_recipe.base)),
-        pulled,
-    )];
-    let mut stage = Stage::new(
-        ConfigState::from_base(&image.config, image.layers)?,
-        recipe.escape,
-    );
+    let mut step_times = Vec::new();
+    let images = pull_images(&blobs, &image_uses(&recipe, &plan), trace, &mut step_times)?;
     let vm = Vm::new(exe, &install, &store, opts.resources);
     let resolv_conf = dns::resolv_conf();
     let env = StepEnv {
@@ -124,34 +119,193 @@ fn build_inner(exe: &Path, opts: &Options, trace: &mut Trace) -> Result<Descript
         resolv_conf: &resolv_conf,
         opts,
     };
-    for (i, step) in stage_recipe.steps.iter().enumerate() {
-        let n = i + 2;
-        let label = format!("step {n}/{total} {}", shown(&step.text));
-        eprintln!("[{n}/{total}] {}", shown(&step.text));
+    let total: usize = plan
+        .order
+        .iter()
+        .map(|&index| recipe.stages[index].steps.len() + 1)
+        .sum();
+    // Single-stage output stays as it was; with several stages, every line
+    // names its stage.
+    let multi = plan.order.len() > 1;
+    let mut done: Vec<Option<ConfigState>> = vec![None; recipe.stages.len()];
+    // One count across stages, so step numbers (and kmsg files) are unique.
+    let mut n = 0;
+    for &index in &plan.order {
+        let stage_recipe = &recipe.stages[index];
+        let planned = &plan.stages[index];
+        let name = stage_name(stage_recipe, index);
+        let tag = if multi {
+            format!("[{name}] ")
+        } else {
+            String::new()
+        };
+        let args = if multi {
+            vec![("stage".to_string(), name)]
+        } else {
+            Vec::new()
+        };
+        n += 1;
+        eprintln!("[{n}/{total}] {tag}FROM {}", stage_recipe.base);
         let t0 = Instant::now();
-        let result = run_step(&env, trace, &mut stage, step, (n, total));
+        let base = match &planned.base {
+            Base::Scratch => ConfigState::scratch(Arch::default()),
+            Base::Stage(parent) => done[*parent]
+                .clone()
+                .expect("a stage's dependencies are built before it"),
+            Base::Image(reference) => images[reference.as_str()].clone(),
+        };
+        let mut stage = Stage::new(base, recipe.escape);
         let dur = t0.elapsed();
-        trace.push(Span {
-            name: label.clone(),
-            start: trace.at(t0),
+        eprintln!("[{n}/{total}] done in {:.2}s", dur.as_secs_f64());
+        step_times.push((
+            format!("step {n}/{total} {tag}FROM {}", shown(&stage_recipe.base)),
             dur,
-            args: Vec::new(),
-        });
-        step_times.push((label.clone(), dur));
-        if let Err(e) = result {
-            if opts.timings {
-                print_summary(step_times);
+        ));
+        let built = Built {
+            done: &done,
+            images: &images,
+        };
+        for (step, source) in stage_recipe.steps.iter().zip(&planned.sources) {
+            n += 1;
+            let label = format!("step {n}/{total} {tag}{}", shown(&step.text));
+            eprintln!("[{n}/{total}] {tag}{}", shown(&step.text));
+            let t0 = Instant::now();
+            let result = built
+                .copy_source(source)
+                .and_then(|from| run_step(&env, trace, &mut stage, step, from, (n, total)));
+            let dur = t0.elapsed();
+            trace.push(Span {
+                name: label.clone(),
+                start: trace.at(t0),
+                dur,
+                args: args.clone(),
+            });
+            step_times.push((label.clone(), dur));
+            if let Err(e) = result {
+                if opts.timings {
+                    print_summary(step_times);
+                }
+                return Err(e.context(label));
             }
-            return Err(e.context(label));
         }
+        done[index] = Some(stage.state);
     }
+    let target = done[plan.target]
+        .as_ref()
+        .expect("the target is the last stage built");
     let descriptor = timed(trace, "write layout", || {
-        image::write_layout(&blobs, &stage.state, &opts.output, &opts.tag)
+        image::write_layout(&blobs, target, &opts.output, &opts.tag)
     })?;
     if opts.timings {
         print_summary(step_times);
     }
     Ok(descriptor)
+}
+
+/// The stage's name, or its index for an unnamed stage.
+fn stage_name(stage: &StageRecipe, index: usize) -> String {
+    match &stage.name {
+        Some(name) => name.clone(),
+        None => format!("stage {index}"),
+    }
+}
+
+/// An image the build pulls and the instruction that first names it.
+#[derive(Debug)]
+struct ImageUse<'a> {
+    reference: &'a str,
+    line: usize,
+    /// `FROM ` or `COPY --from=`, written before the reference in errors.
+    instruction: &'static str,
+}
+
+/// Images that the stages in `plan.order` name, each once, in first-use
+/// order. Unreachable stages pull nothing.
+fn image_uses<'a>(recipe: &'a Recipe, plan: &'a BuildPlan) -> Vec<ImageUse<'a>> {
+    fn add<'a>(uses: &mut Vec<ImageUse<'a>>, new: ImageUse<'a>) {
+        if !uses.iter().any(|u| u.reference == new.reference) {
+            uses.push(new);
+        }
+    }
+    let mut uses = Vec::new();
+    for &index in &plan.order {
+        let (stage, planned) = (&recipe.stages[index], &plan.stages[index]);
+        if let Base::Image(reference) = &planned.base {
+            add(
+                &mut uses,
+                ImageUse {
+                    reference,
+                    line: stage.line,
+                    instruction: "FROM ",
+                },
+            );
+        }
+        for (step, source) in stage.steps.iter().zip(&planned.sources) {
+            if let Source::Image(reference) = source {
+                add(
+                    &mut uses,
+                    ImageUse {
+                        reference,
+                        line: step.line,
+                        instruction: "COPY --from=",
+                    },
+                );
+            }
+        }
+    }
+    uses
+}
+
+/// Pulls every image in `uses` before any VM runs, so a bad reference or
+/// a network failure costs no build time. Returns each image's base state.
+fn pull_images<'a>(
+    blobs: &BlobStore<'_>,
+    uses: &[ImageUse<'a>],
+    trace: &mut Trace,
+    step_times: &mut Vec<(String, Duration)>,
+) -> Result<HashMap<&'a str, ConfigState>> {
+    let mut images = HashMap::with_capacity(uses.len());
+    for u in uses {
+        let what = || format!("line {}: {}{}", u.line, u.instruction, u.reference);
+        eprintln!("pulling {}", u.reference);
+        let t0 = Instant::now();
+        let image = registry::pull(blobs, u.reference).with_context(what)?;
+        let state = ConfigState::from_base(&image.config, image.layers).with_context(what)?;
+        let dur = t0.elapsed();
+        trace.push(Span {
+            name: "pull".into(),
+            start: trace.at(t0),
+            dur,
+            args: vec![("reference".into(), u.reference.into())],
+        });
+        eprintln!("pulled {} in {:.2}s", u.reference, dur.as_secs_f64());
+        step_times.push((format!("pull {}", shown(u.reference)), dur));
+        images.insert(u.reference, state);
+    }
+    Ok(images)
+}
+
+/// Completed stages and pulled images: what `COPY --from` reads.
+struct Built<'a> {
+    done: &'a [Option<ConfigState>],
+    images: &'a HashMap<&'a str, ConfigState>,
+}
+
+impl Built<'_> {
+    /// Where a COPY reads from. A stage or image contributes its layers,
+    /// never its config.
+    fn copy_source(&self, source: &Source) -> Result<CopySource> {
+        let state = match source {
+            Source::Context => return Ok(CopySource::Context),
+            Source::Stage(index) => self.done[*index]
+                .as_ref()
+                .expect("a stage's dependencies are built before it"),
+            Source::Image(reference) => &self.images[reference.as_str()],
+        };
+        Ok(CopySource::Layers {
+            lower: state.lower_layers()?,
+        })
+    }
 }
 
 /// Prints the step durations, longest first.
@@ -177,6 +331,7 @@ fn run_step(
     trace: &mut Trace,
     stage: &mut Stage,
     step: &Step,
+    from: CopySource,
     (n, total): (usize, usize),
 ) -> Result<()> {
     let step_start = trace.at(Instant::now());
@@ -196,18 +351,22 @@ fn run_step(
             false,
             shell_form,
         ),
-        Action::Copy { sources, dest } => (
-            Job::Copy(CopyJob {
-                lower: stage.state.lower_layers()?,
-                sources,
-                dest,
-                workdir: stage.workdir(),
-                source: CopySource::Context,
-            }),
-            Some(env.context),
-            true,
-            false,
-        ),
+        Action::Copy { sources, dest } => {
+            // Only a context copy needs the context shared.
+            let ctx = matches!(from, CopySource::Context).then_some(env.context);
+            (
+                Job::Copy(CopyJob {
+                    lower: stage.state.lower_layers()?,
+                    sources,
+                    dest,
+                    workdir: stage.workdir(),
+                    source: from,
+                }),
+                ctx,
+                true,
+                false,
+            )
+        }
     };
     let finished = env.vm.run(&job, ctx)?;
     if let Some(dir) = std::env::var_os(vm::DEBUG_KMSG_ENV) {
@@ -533,6 +692,27 @@ mod tests {
         assert!(
             msg.contains("last command started: test \\x1b[2J = x ("),
             "{msg}"
+        );
+    }
+
+    #[test]
+    fn pulls_each_reachable_image_once_in_first_use_order() {
+        let recipe = dockerfile::check(
+            "FROM alpine AS base\nFROM busybox AS unused\nFROM base AS builder\nCOPY --from=busybox:1.36 /x /x\nCOPY --from=alpine /y /y\nFROM debian\nCOPY --from=builder /a /a\nCOPY --from=busybox:1.36 /b /b\n",
+        )
+        .unwrap();
+        let plan = plan::resolve(&recipe, None).unwrap();
+        let uses: Vec<_> = image_uses(&recipe, &plan)
+            .iter()
+            .map(|u| (u.reference, u.line, u.instruction))
+            .collect();
+        assert_eq!(
+            uses,
+            [
+                ("alpine", 1, "FROM "),
+                ("busybox:1.36", 4, "COPY --from="),
+                ("debian", 6, "FROM "),
+            ]
         );
     }
 

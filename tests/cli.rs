@@ -101,3 +101,31 @@ fn trace_file_is_written_when_the_build_fails() {
         .collect();
     assert!(names.contains(&"build"), "{names:?}");
 }
+
+/// Runs `build` on `dockerfile` with no usable libkrun, so it can only fail
+/// before pulling or booting a VM.
+fn build_without_vm(dockerfile: &str, extra: &[&str]) -> String {
+    let ctx = tempfile::tempdir().unwrap();
+    std::fs::write(ctx.path().join("Dockerfile"), dockerfile).unwrap();
+    let output = sandcastle()
+        .args(["build", "-t", "demo", "-o"])
+        .arg(ctx.path().join("out"))
+        .args(extra)
+        .arg(ctx.path())
+        .env("SANDCASTLE_LIBKRUN_DIR", "/nonexistent")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn build_resolves_the_target_before_pulling() {
+    let stderr = build_without_vm("FROM alpine AS app\n", &["--target", "nope"]);
+    assert!(
+        stderr.contains("target stage \"nope\" could not be found"),
+        "{stderr}"
+    );
+    let stderr = build_without_vm("FROM scratch AS a\nCOPY --from=b /x /x\nFROM a AS b\n", &[]);
+    assert!(stderr.contains("stage dependency cycle"), "{stderr}");
+}
